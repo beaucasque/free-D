@@ -1,0 +1,5 @@
+pyserial>=3.5
+# pysurvive : uniquement pour --source survive
+# Installation depuis les sources recommandee, le paquet PyPI est souvent en retard :
+#   git clone https://github.com/collabora/libsurvive
+#   cd libsurvive && pip install .

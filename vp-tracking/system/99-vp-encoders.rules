@@ -1,0 +1,13 @@
+# Chemin stable pour le RP2040 des encodeurs d'objectif.
+#
+# Remplace XXXXXXXX par le numero de serie renvoye par tools/find-device.sh
+#
+# ID_MM_DEVICE_IGNORE empeche ModemManager de sonder le port avec des
+# commandes AT au branchement — sur Ubuntu c'est la cause n1 de flux
+# corrompu dans les premieres secondes.
+#
+# Installation :
+#   sudo cp 99-vp-encoders.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2e8a", ATTRS{serial}=="XXXXXXXX", SYMLINK+="vp_encoders", ENV{ID_MM_DEVICE_IGNORE}="1", MODE="0660", GROUP="dialout"
