@@ -1,40 +1,63 @@
 #!/usr/bin/env python3
 """
-vp_bridge.py — Emet du Free-D vers Unreal a partir du tracker et des encodeurs.
+vp_bridge.py — Emet du Free-D vers Unreal a partir de trois trackers Vive.
 
-TROIS MODES, a valider dans cet ordre :
+v3 : tout Vive. Les AS5600, le QT Py et le mux ont disparu, et avec eux le
+piege du port CDC unique, la regle udev vp_encoders et ModemManager. Les
+trois poses sortent du meme event loop libsurvive : position, zoom et focus
+partagent la meme horloge, il n'y a plus deux chaines de latence a realigner.
 
-  --source simulate
-      N'a besoin d'aucun materiel. Genere un mouvement de camera synthetique
-      et un zoom/focus qui balaient leur course. Sert a valider toute la
-      chaine Unreal (plugin LiveLinkFreeD, CineCameraActor, LensFile) avant
-      d'avoir le moindre capteur branche.
+  tracker CAMERA  -> pan/tilt/roll + X/Y/Z
+  tracker FOCUS   -> twist autour de son axe calibre -> champ focus
+  tracker ZOOM    -> idem -> champ zoom
 
-  --source serial
-      Encodeurs reels, pose synthetique. Valide les AS5600 et le mapping
-      zoom/focus dans Unreal, sans dependre de libsurvive.
+SOUSTRACTION DU MOUVEMENT CAMERA
+    Le zoom et le focus sont calcules sur q_rel = conj(q_camera) * q_objectif :
+    tout mouvement commun aux deux trackers s'annule. Mais les trackers ne
+    sont pas echantillonnes au meme instant, et confronter un q_camera perime
+    a un q_objectif recent fabrique une rotation parasite proportionnelle a
+    la vitesse angulaire de la camera.
 
-  --source survive
-      Tout reel. Tracker via pysurvive, encodeurs via serie.
+    Le bridge maintient donc un historique camera et interpole (slerp) a
+    l'horodatage exact de chaque echantillon objectif. Un echantillon
+    objectif plus recent que tout l'historique camera est DIFFERE d'un tick
+    au lieu d'etre traite avec une pose extrapolee — c'est la seule facon que
+    la soustraction soit exacte plutot qu'approximative.
 
-Ce decoupage est deliberé : chaque etape n'introduit qu'une seule inconnue.
-Quand ca casse, on sait ou.
+CONTROLE D'INTEGRITE
+    La distance camera <-> objectif est une constante mecanique. Si elle
+    derive, un support a glisse et l'axe calibre est faux. Affiche SLIP.
+
+DEUX MODES
+  --source simulate   aucun materiel, valide la chaine Unreal
+  --source survive    trois trackers USB + bridge/axes.json
 
 EXEMPLES
-    ./vp_bridge.py --source simulate --host 127.0.0.1
-    ./vp_bridge.py --source serial --port /dev/vp_encoders
-    ./vp_bridge.py --source survive --port /dev/vp_encoders --host 192.168.1.73
+    ./vp_bridge.py --source simulate --verbose
+    ./vp_bridge.py --source survive --host 127.0.0.1 --rate 60 --verbose
+    ./vp_bridge.py --list-devices
 """
 
 import argparse
 import math
+import os
 import signal
 import sys
 import time
 
-from freed import FreeDSender, decode_d1, encode_d1, survive_to_freed
+import lensaxis
+import survive_clock
+import worldframe
+from freed import FreeDSender, decode_d1, survive_to_freed
 
 running = True
+
+DEFAULT_AXES = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "axes.json")
+DEFAULT_WORLD = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "world.json")
+
+PENDING_MAX_AGE = 0.20      # au-dela, l'echantillon objectif est perime
 
 
 def _stop(signum, frame):
@@ -42,121 +65,287 @@ def _stop(signum, frame):
     running = False
 
 
-class EncoderReader:
-    """Lit les trames 'E:F:<n> Z:<n> S:<xx>' du RP2040.
+# ------------------------------------------------------------------ libsurvive
 
-    Non bloquant : on garde toujours la derniere valeur connue. Si la carte
-    se tait, on continue d'emettre l'ancienne valeur plutot que de figer tout
-    le bridge — un zoom qui ne bouge plus est moins grave qu'un tracking mort.
+
+def dev_names(obj):
+    """Identifiants d'un objet libsurvive : serie si disponible, nom de code
+    sinon. axes.json accepte n'importe lequel — mais jamais l'ordre
+    d'enumeration : trois trackers identiques sur un hub ne remontent pas
+    dans un ordre garanti au redemarrage."""
+    out = []
+    for attr in ("Serial", "SerialNumber", "Name"):
+        fn = getattr(obj, attr, None)
+        if fn is None:
+            continue
+        try:
+            v = fn()
+        except Exception:
+            continue
+        if isinstance(v, bytes):
+            v = v.decode("utf8", "replace")
+        v = str(v).strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+class SurviveSource:
+    """Trois trackers, une file, un vidage complet par tick.
+
+    NextUpdated() n'est pas bloquant. L'appeler une seule fois par tick
+    laissait la file libsurvive grossir sans limite : la latence croissait
+    avec le nombre de peripheriques. Invisible avec un tracker, franche avec
+    trois. On vide toujours, entierement.
     """
 
-    def __init__(self, port, baud=115200):
-        import serial
-        self.ser = serial.Serial(port, baud, timeout=0)
-        self.focus = 0
-        self.zoom = 0
-        self.status = "??"
-        self.last_update = 0.0
-        self._buf = b""
+    def __init__(self, axes_path, world_path=None, cam_span=1.0, slip_mm=8.0):
+        try:
+            import pysurvive
+        except ImportError:
+            sys.exit("pysurvive absent : voir bridge/requirements.txt")
+
+        if not os.path.exists(axes_path):
+            sys.exit("axes.json introuvable (%s).\n"
+                     "Lance tools/calib-axis.py --list, puis --set-camera "
+                     "et --axis." % axes_path)
+        cfg = lensaxis.load(axes_path)
+
+        self.camera = cfg.get("camera")
+        if not self.camera:
+            sys.exit("Tracker camera non declare dans axes.json.")
+        self.axes = cfg.get("axes", {})
+        if not self.axes:
+            sys.exit("Aucun axe calibre dans axes.json.")
+
+        # Repere plateau. Applique au tracker CAMERA uniquement : le zoom et
+        # le focus sont calcules en relatif camera, le repere monde ne les
+        # touche pas.
+        self.world = None
+        if world_path and os.path.exists(world_path):
+            self.world = worldframe.load(world_path)
+            print("Repere plateau : %s" % world_path)
+        else:
+            print("Repere plateau : aucun — poses brutes libsurvive. "
+                  "Lance tools/calib-world.py.")
+
+        self.ctx = pysurvive.SimpleContext(sys.argv[:1])
+        # Horodater au drain est faux : le retard de file n'est pas le meme
+        # pour deux trackers draines dans la meme rafale, et c'est justement
+        # cet ecart que le slerp doit annuler. On decouvre l'horloge de
+        # libsurvive plutot que de la supposer.
+        self.clock = survive_clock.SurviveClock()
+        self.hist = lensaxis.CameraHistory(span=cam_span)
+        self.last_pose = (0.0, 0.0, 1.5, 1.0, 0.0, 0.0, 0.0)
+        self.cam_seen = 0.0
+        self.dropped_stale = 0
+
+        self.state = {}
+        for name, cal in self.axes.items():
+            self.state[name] = {
+                "cal": cal,
+                "acc": lensaxis.Accumulator(),
+                "filt": lensaxis.OneEuro(),
+                "watch": lensaxis.MountWatch(tolerance_mm=slip_mm),
+                "inv_ref": lensaxis.q_conj(tuple(cal["ref"])),
+                "pending": [],
+                "value": 0,
+                "seen": 0.0,
+                "last_t": 0.0,
+                "slip": False,
+            }
+
+        print("Camera : %s" % self.camera)
+        for name, cal in self.axes.items():
+            print("  %-6s %s  course %.0f deg%s"
+                  % (name, cal["device"], cal["span_deg"],
+                     "  [MULTI-TOUR]" if cal["span_deg"] >= 355.0 else ""))
+
+    # -- lecture -----------------------------------------------------------
 
     def poll(self):
-        try:
-            data = self.ser.read(4096)
-        except Exception:
-            return
-        if not data:
-            return
-        self._buf += data
-        while b"\n" in self._buf:
-            line, self._buf = self._buf.split(b"\n", 1)
-            self._parse(line.decode("utf8", "replace").strip())
+        now = time.monotonic()
+        by_device = {c["device"]: n for n, c in self.axes.items()}
 
-    def _parse(self, line):
-        # Tout ce qui ne commence pas par E: est du bruit REPL, on jette.
-        if not line.startswith("E:"):
-            return
-        try:
-            for token in line[2:].split():
-                key, _, value = token.partition(":")
-                if key == "F":
-                    self.focus = int(value)
-                elif key == "Z":
-                    self.zoom = int(value)
-                elif key == "S":
-                    self.status = value
-            self.last_update = time.monotonic()
-        except ValueError:
-            pass
+        # 1. Vider la file. La camera va dans l'historique, les objectifs
+        #    dans leur file d'attente respective.
+        while True:
+            u = self.ctx.NextUpdated()
+            if u is None:
+                break
+            p = u.Pose()[0]
+            pos = (p.Pos[0], p.Pos[1], p.Pos[2])
+            quat = (p.Rot[0], p.Rot[1], p.Rot[2], p.Rot[3])
+            names = dev_names(u)
 
-    def stale(self, timeout=1.0):
-        return (time.monotonic() - self.last_update) > timeout
+            raw = survive_clock.read_timecode(u)
+            self.clock.feed(raw, now)
+            if self.clock.state == "apprentissage" and self.clock.ready():
+                if self.clock.solve():
+                    print(self.clock.describe())
+            t = self.clock.to_mono(raw, now)
 
-    def close(self):
-        self.ser.close()
+            if self.camera in names:
+                # L'historique garde la pose BRUTE : la soustraction du
+                # mouvement camera pour le zoom et le focus doit se faire
+                # dans le repere ou les deux trackers sont exprimes, pas
+                # dans le repere plateau.
+                self.hist.push(t, quat, pos)
+                self.last_pose = (worldframe.apply(self.world, pos, quat)
+                                  if self.world else pos + quat)
+                self.cam_seen = now
+                continue
+            for n in names:
+                name = by_device.get(n)
+                if name is not None:
+                    st = self.state[name]
+                    st["pending"].append((t, quat, pos))
+                    st["seen"] = now
+                    break
+
+        # 2. Resoudre ce qui est interpolable. Ce qui est plus recent que
+        #    l'historique camera attend le tick suivant.
+        for name, st in self.state.items():
+            keep = []
+            for t, quat, pos in st["pending"]:
+                got = self.hist.at(t)
+                if got is None:
+                    keep.append((t, quat, pos))
+                    continue
+                q_cam, p_cam, kind = got
+                if kind == "extrap":
+                    if now - t < PENDING_MAX_AGE:
+                        keep.append((t, quat, pos))
+                    else:
+                        self.dropped_stale += 1
+                    continue
+                if kind == "stale":
+                    self.dropped_stale += 1
+                    continue
+                self._update(st, t, quat, pos, q_cam, p_cam)
+            st["pending"] = keep
+
+    def _update(self, st, t, q_lens, p_lens, q_cam, p_cam):
+        gap = t - st["last_t"] if st["last_t"] else 0.0
+        st["last_t"] = t
+
+        q_rel = lensaxis.relative(q_cam, q_lens)
+        dq = lensaxis.q_mul(st["inv_ref"], q_rel)
+        theta = st["acc"].push(lensaxis.twist_angle(dq, st["cal"]["axis"]),
+                               gap=gap)
+        theta = st["filt"](theta, t)
+        st["value"] = lensaxis.to_freed(theta,
+                                        st["cal"]["lo"], st["cal"]["hi"],
+                                        invert=st["cal"].get("invert", False))
+
+        if st["watch"].push(lensaxis.relative_position(q_cam, p_cam, p_lens)):
+            st["slip"] = True
+
+    # -- sortie ------------------------------------------------------------
+
+    def pose(self):
+        return self.last_pose
+
+    def lens(self):
+        return (self.state.get("zoom", {}).get("value", 0),
+                self.state.get("focus", {}).get("value", 0))
+
+    def health(self, timeout=0.5):
+        now = time.monotonic()
+        bits = []
+        if not self.cam_seen:
+            bits.append("CAM:ABSENT")
+        elif now - self.cam_seen > timeout:
+            bits.append("CAM:MUET")
+        for name, st in self.state.items():
+            tag = name.upper()[:3]
+            if not st["seen"]:
+                bits.append("%s:ABSENT" % tag)
+            elif now - st["seen"] > timeout:
+                bits.append("%s:MUET" % tag)
+            if st["acc"].dropout():
+                bits.append("%s:DROPOUT" % tag)
+            if st["slip"]:
+                bits.append("%s:SLIP%+.0fmm" % (tag, st["watch"].drift * 1000))
+        if self.dropped_stale:
+            bits.append("skip=%d" % self.dropped_stale)
+        rate = math.degrees(self.hist.rate())
+        if self.clock.state == "monotonic":
+            bits.append("HORLOGE:DRAIN")
+        return ("%s  cam=%3.0f deg/s" % (" ".join(bits) if bits else "OK", rate))
+
+
+def cmd_list_devices(duration):
+    try:
+        import pysurvive
+    except ImportError:
+        sys.exit("pysurvive absent.")
+    ctx = pysurvive.SimpleContext(sys.argv[:1])
+    seen = {}
+    t_end = time.monotonic() + duration
+    while time.monotonic() < t_end:
+        u = ctx.NextUpdated()
+        if u is None:
+            time.sleep(0.01)
+            continue
+        n = dev_names(u)
+        if n:
+            seen[n[0]] = n
+    if not seen:
+        sys.exit("Aucun peripherique lighthouse. Verifie 81-vive.rules, le "
+                 "hub alimente, et qu'aucun SteamVR ne tourne ailleurs.")
+    for k, names in sorted(seen.items()):
+        print("%-24s %s" % (k, ", ".join(names[1:]) or "-"))
+    return 0
+
+
+# -------------------------------------------------------------------- simulate
 
 
 def synthetic_pose(t):
-    """Camera qui decrit lentement un arc, a hauteur d'epaule.
-
-    Amplitudes volontairement modestes : on veut verifier que ca bouge dans
-    le bon sens, pas impressionner. Un mouvement ample masque les erreurs de
-    signe d'axe, un mouvement lent les revele.
-    """
     radius = 2.0
     angle = 0.15 * t
     x = radius * math.cos(angle)
     y = radius * math.sin(angle)
     z = 1.5 + 0.1 * math.sin(0.4 * t)
-
-    # La camera regarde vers l'origine
     yaw = angle + math.pi
     pitch = -0.05 * math.sin(0.3 * t)
-
     cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
     cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
-    qw = cy * cp
-    qx = cy * sp * 0.0 + sy * sp
-    qy = cy * sp
-    qz = sy * cp
-    return (x, y, z, qw, qx, qy, qz)
+    return (x, y, z, cy * cp, sy * sp, cy * sp, sy * cp)
 
 
 def synthetic_lens(t):
-    """Zoom et focus qui balaient leur course a des vitesses differentes."""
-    zoom = int(32768 * (0.5 + 0.5 * math.sin(0.25 * t)))
-    focus = int(32768 * (0.5 + 0.5 * math.sin(0.17 * t + 1.0)))
+    zoom = int(65535 * (0.5 + 0.5 * math.sin(0.25 * t)))
+    focus = int(65535 * (0.5 + 0.5 * math.sin(0.17 * t + 1.0)))
     return zoom, focus
 
 
-def map_encoder(raw, lo, hi):
-    """Position accumulee -> valeur Free-D 0..65535 sur la course calibree."""
-    if hi == lo:
-        return 0
-    v = (raw - lo) / (hi - lo)
-    return int(max(0, min(65535, v * 65535)))
+# ------------------------------------------------------------------------ main
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", choices=("simulate", "serial", "survive"),
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--source", choices=("simulate", "survive"),
                    default="simulate")
-    p.add_argument("--host", default="127.0.0.1",
-                   help="adresse de la machine Unreal")
+    p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--udp-port", type=int, default=40000)
-    p.add_argument("--port", default="/dev/vp_encoders",
-                   help="port serie du RP2040")
+    p.add_argument("--axes", default=DEFAULT_AXES)
+    p.add_argument("--world", default=DEFAULT_WORLD,
+                   help="repere plateau produit par tools/calib-world.py")
     p.add_argument("--rate", type=float, default=60.0,
-                   help="cadence d'emission en Hz (aligner sur la cadence video)")
+                   help="cadence d'emission (aligner sur la cadence video)")
     p.add_argument("--camera-id", type=int, default=1)
-    p.add_argument("--tracker", default=None,
-                   help="nom du tracker libsurvive (defaut : le premier trouve)")
-    p.add_argument("--focus-range", nargs=2, type=int, metavar=("LO", "HI"),
-                   default=(0, 4096))
-    p.add_argument("--zoom-range", nargs=2, type=int, metavar=("LO", "HI"),
-                   default=(0, 4096))
+    p.add_argument("--slip-mm", type=float, default=8.0,
+                   help="derive de montage toleree avant alerte SLIP")
+    p.add_argument("--list-devices", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
+
+    if args.list_devices:
+        return cmd_list_devices(10.0)
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
@@ -165,32 +354,15 @@ def main():
     print("Free-D -> %s:%d a %.1f Hz (source: %s)"
           % (args.host, args.udp_port, args.rate, args.source))
 
-    encoders = None
-    if args.source in ("serial", "survive"):
-        try:
-            encoders = EncoderReader(args.port)
-            print("Encodeurs : %s" % args.port)
-        except Exception as e:
-            print("Impossible d'ouvrir %s : %s" % (args.port, e), file=sys.stderr)
-            print("Verifie le groupe dialout et la regle udev.", file=sys.stderr)
-            return 1
-
-    survive_ctx = None
-    if args.source == "survive":
-        try:
-            import pysurvive
-            survive_ctx = pysurvive.SimpleContext(sys.argv[:1])
-            print("libsurvive initialise")
-        except ImportError:
-            print("pysurvive absent : pip install pysurvive", file=sys.stderr)
-            return 1
+    src = (SurviveSource(args.axes, world_path=args.world,
+                         slip_mm=args.slip_mm)
+           if args.source == "survive" else None)
 
     period = 1.0 / args.rate
     t0 = time.monotonic()
     next_tick = t0
     next_report = t0 + 1.0
     frames = 0
-    last_pose = (0.0, 0.0, 1.5, 1.0, 0.0, 0.0, 0.0)
 
     while running:
         now = time.monotonic()
@@ -198,46 +370,27 @@ def main():
             time.sleep(min(period / 4, next_tick - now))
             continue
         next_tick += period
-        if next_tick < now:              # on a pris du retard : on resynchronise
+        if next_tick < now:
             next_tick = now + period
 
-        t = now - t0
-
-        if encoders:
-            encoders.poll()
-
-        # --- pose ---
-        if args.source == "survive":
-            updated = survive_ctx.NextUpdated()
-            if updated is not None:
-                if args.tracker is None or updated.Name().decode() == args.tracker:
-                    pos = updated.Pose()[0].Pos
-                    rot = updated.Pose()[0].Rot
-                    last_pose = (pos[0], pos[1], pos[2],
-                                 rot[0], rot[1], rot[2], rot[3])
-            pose = last_pose
+        if src:
+            src.poll()
+            pose = src.pose()
+            zoom, focus = src.lens()
         else:
+            t = now - t0
             pose = synthetic_pose(t)
-
-        # --- objectif ---
-        if encoders and not encoders.stale():
-            zoom = map_encoder(encoders.zoom, *args.zoom_range)
-            focus = map_encoder(encoders.focus, *args.focus_range)
-        else:
             zoom, focus = synthetic_lens(t)
 
-        packet = survive_to_freed(pose, zoom=zoom, focus=focus,
-                                  camera_id=args.camera_id)
-        sender.send(packet)
+        sender.send(survive_to_freed(pose, zoom=zoom, focus=focus,
+                                     camera_id=args.camera_id))
         frames += 1
 
         if args.verbose and now >= next_report:
             next_report = now + 1.0
-            d = decode_d1(packet)
-            extra = ""
-            if encoders:
-                extra = "  enc=%s%s" % (encoders.status,
-                                        " [MUET]" if encoders.stale() else "")
+            d = decode_d1(survive_to_freed(pose, zoom=zoom, focus=focus,
+                                           camera_id=args.camera_id))
+            extra = ("  %s" % src.health()) if src else ""
             print("%5d pkt/s  pan=%7.2f tilt=%6.2f  x=%7.1f y=%7.1f z=%6.1f mm  "
                   "zoom=%5d focus=%5d%s"
                   % (frames, d["pan"], d["tilt"], d["x"], d["y"], d["z"],
@@ -246,8 +399,6 @@ def main():
 
     print("\nArret. %d paquets emis." % sender.sent)
     sender.close()
-    if encoders:
-        encoders.close()
     return 0
 
 
