@@ -1,0 +1,8 @@
+numpy>=1.24
+# pysurvive : uniquement pour --source survive et tools/calib-axis.py
+#   git clone https://github.com/collabora/libsurvive
+#   cd libsurvive && pip install .
+#   sudo cp useful_files/81-vive.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#
+# pyserial n'est plus necessaire : plus d'encodeurs AS5600.

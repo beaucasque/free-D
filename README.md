@@ -1,121 +1,94 @@
-# vp-tracking
+# free-D — tracking caméra virtuelle tout-Vive, sans SteamVR
 
-Chaîne de tracking pour production virtuelle sous Linux, **sans SteamVR et sans casque** :
-pose 6DoF d'un tracker Vive via libsurvive, zoom et focus via encodeurs magnétiques,
-le tout émis en Free-D vers Unreal Engine.
+Chaîne de tracking pour production virtuelle sous Linux : pose 6DoF d'un tracker Vive via
+**libsurvive**, zoom et focus lus comme rotation relative de deux autres trackers, le tout
+émis en **Free-D** vers Unreal Engine (plugin LiveLinkFreeD).
 
-Conçu pour un plateau où le retour vidéo sort en SDI vers un moniteur caméra —
-pas de HMD, pas de compositeur VR sur la machine de rendu.
+**Ni SteamVR, ni casque, ni compositeur VR.** Le retour vidéo sort en SDI vers un moniteur
+caméra.
 
-## Architecture
+Spécification complète : [`docs/HANDOFF-free-D-v4.md`](docs/HANDOFF-free-D-v4.md).
+
+## État — 30 août 2026
+
+**Le code est complet et ses auto-tests passent.** Rien n'a encore tourné sur le matériel
+réel : toute la validation terrain reste à faire.
 
 ```
-2× base stations 2.0
-    ↓ (IR)
-Vive Tracker 3.0 sur la caméra ──── USB ────┐
-                                            │
-2× AS5600 (bagues zoom / focus)             │
-    ↓ I²C                                   │
-RP2040-Zero ─────────── USB CDC ────────────┤
-                                            ↓
-                                  Ubuntu Studio 22.04
-                                  libsurvive + vp_bridge.py
-                                            ↓ UDP:40000
-                                  Unreal Engine 5.8
-                                  LiveLinkFreeD → CineCameraActor
-                                            ↓
-                                  Composure → DeckLink SDI 4K
+bridge/freed.py           OK — encodage/décodage cohérents, checksum valide
+bridge/lensaxis.py        OK — axe, multi-tour, alignement temporel, chien de garde
+bridge/worldframe.py      OK — sol, écran, ligne médiane, caméra et base stations
+bridge/survive_clock.py   OK — unité détectée, offset calé sur le plancher, replis sûrs
+tools/calib-world.py      OK — trois points suffisent
+tools/test-decouple.py    Chaîne validée — le mouvement caméra est correctement soustrait
 ```
 
-**Pourquoi des encodeurs plutôt que des trackers sur les bagues :** un Tracker 3.0
-pèse 75 g et se déséquilibre en porte-à-faux sur une roulette de follow focus ;
-il s'occulte contre le corps de l'objectif ; et son comptage multi-tour se perd
-à chaque décrochage optique. Un AS5600 coûte 7 $, ne s'occulte jamais, et ne
-perd jamais le compte.
+Le chiffre le plus parlant vient du dernier : **alignement temporel 106 fois meilleur que
+le naïf, résidu 0,01 ms** — c'est ce que le §6bis du handoff cherchait à démontrer.
 
-## Ordre de validation
+⚠️ `calib-axis.py`, `gui-decouple.py` et `vp-console.py` **n'ont pas** de `--selftest`,
+contrairement à ce qu'annonce le §5 du handoff.
 
-Chaque étape n'introduit qu'une seule inconnue. **Ne pas sauter d'étape** —
-c'est tout l'intérêt du découpage.
-
-| # | Étape | Commande | Ce qu'on valide |
-|---|---|---|---|
-| 1 | Unreal seul | `bridge/vp_bridge.py --source simulate` | Plugin LiveLinkFreeD, CineCameraActor, sens des axes |
-| 2 | Aimants | `tools/test-sweep.py` | Aimantation diamétrale, entrefer, linéarité |
-| 3 | Encodeurs | `bridge/vp_bridge.py --source serial` | Mapping zoom/focus dans Unreal |
-| 4 | Tracker seul | `survive-cli` | Calibration lighthouses, stabilité de la pose |
-| 5 | Chaîne complète | `bridge/vp_bridge.py --source survive` | Fusion, latence, alignement vidéo |
-
-L'étape 1 ne demande **aucun matériel** : elle se lance aujourd'hui, avant
-même que les aimants soient livrés.
-
-## Démarrage
-
-```bash
-git clone <url> ~/vp-tracking
-cd ~/vp-tracking
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r bridge/requirements.txt
-```
-
-Puis, dans l'ordre :
-
-```bash
-# Identifier la carte et générer la règle udev
-tools/find-device.sh
-
-sudo cp system/99-vp-encoders.rules /etc/udev/rules.d/   # après avoir mis le n° de série
-sudo udevadm control --reload-rules && sudo udevadm trigger
-
-# Déployer le firmware
-tools/deploy-firmware.sh
-
-# Diagnostiquer les aimants
-tools/test-sweep.py --sensor F --duration 15
-tools/test-sweep.py --sensor Z --duration 15
-
-# Émettre vers Unreal
-bridge/vp_bridge.py --source simulate --host 127.0.0.1 --verbose
-```
-
-## Contrainte structurante : un seul port CDC
-
-Le RP2040 n'expose **qu'un seul port série**, partagé entre le REPL MicroPython
-et le flux de données. Deux clients simultanés sur `/dev/vp_encoders` reçoivent
-des octets tronqués, **sans erreur explicite**.
-
-Conséquence : le bridge doit être arrêté avant tout travail sur le firmware.
-`tools/deploy-firmware.sh` s'en charge automatiquement.
-
-```bash
-systemctl --user stop vp-bridge     # avant mpremote
-systemctl --user start vp-bridge    # après
-```
-
-En SSH, ne jamais lancer `mpremote repl` sans `timeout` — c'est interactif et
-la session se bloque. Utiliser `tools/read-serial.py` à la place.
+⚠️ `survive_clock.py` s'exécute en mode démonstration : il valide sa logique de repli, pas
+la présence réelle d'un horodatage exposé par pysurvive. C'est la première question ouverte
+du §10.
 
 ## Arborescence
 
 ```
-firmware/vp_encoders.py     MicroPython : 2× AS5600, multi-tour, homing, diagnostic
-bridge/freed.py             Encodage Free-D D1 (29 octets) + conversion de repère
-bridge/vp_bridge.py         Fusion tracker + encodeurs → UDP. 3 modes de source.
-tools/find-device.sh        Identification USB, génération de la règle udev
-tools/deploy-firmware.sh    Déploiement mpremote avec gestion du conflit de port
-tools/test-sweep.py         Verdict automatique sur l'aimant et le montage
-tools/read-serial.py        Lecture série bornée (se termine toujours)
-system/                     Règle udev, service systemd
-docs/HARDWARE.md            Câblage, aimants, montage mécanique
+bridge/      la chaîne temps réel
+  freed.py           encodage du protocole Free-D D1
+  survive_clock.py   découverte de l'horloge libsurvive
+  lensaxis.py        quaternions, SVD, swing-twist, multi-tour, one-euro
+  worldframe.py      plan de sol, repère plateau, lecture des base stations
+  vp_bridge.py       3 trackers → Free-D, applique world.json et axes.json
+  requirements.txt   numpy >= 1.24 (plus pysurvive, hors PyPI)
+tools/       calibration et diagnostic
+  vp-console.py      serveur web, 3 onglets — Studio, Objectifs, Test
+  gui-decouple.py    interface de découplage
+  calib-world.py     équivalent CLI de l'onglet Studio
+  calib-axis.py      équivalent CLI de l'onglet Objectifs
+  test-decouple.py   équivalent CLI de l'onglet Test
+system/      vp-bridge.service
+docs/        HANDOFF-free-D-v4.md — la source de vérité
+archive-v2/  architecture abandonnée, conservée pour mémoire
 ```
 
-## Notes pour Claude Code
+## Prérequis
 
-- Toujours vérifier `systemctl --user is-active vp-bridge` avant de toucher au port série.
-- `bridge/freed.py` a un auto-test intégré : `python3 bridge/freed.py`.
-- Le fichier `vp_cal.json` sur la carte est propre à un montage physique : jamais versionné.
-- Le zéro de homing **n'est pas persistant**, et c'est délibéré. Un encodeur multi-tour
-  ne sait pas dans quel tour il démarre ; restaurer un offset depuis la flash donnerait
-  une valeur fausse dès que la roulette a bougé, carte éteinte.
-- Les corrections d'axes se font dans `quat_to_pan_tilt_roll()`, **jamais** côté Unreal :
-  des corrections aux deux bouts se cumulent et deviennent impossibles à raisonner.
+```bash
+pip install -r bridge/requirements.txt      # numpy
+# puis construire libsurvive et ses bindings Python (pysurvive), hors PyPI
+```
+
+Les trackers doivent être en **USB filaire direct** — libsurvive ne sait pas appairer.
+
+## Démarrage
+
+```bash
+systemctl --user stop vp-bridge     # libsurvive est exclusif : un seul processus
+tools/vp-console.py --demo          # sans matériel
+tools/vp-console.py                 # puis http://127.0.0.1:8410
+```
+
+Séquence de validation complète au §9 du handoff. Ne pas sauter l'étape 2, qui isole les
+problèmes Unreal des problèmes de tracking.
+
+## archive-v2/ — ce qui a été abandonné
+
+La version 2 lisait le zoom et le focus par des **encodeurs magnétiques AS5600** sur un
+RP2040 en CircuitPython, reliés en série. Le §1 du handoff v4 retire cette voie au profit
+de trois trackers Vive : une seule horloge, un seul bus, une seule chaîne de latence.
+
+Disparaissent avec elle le firmware CircuitPython, le protocole série `E:F:...`, la règle
+udev `99-vp-encoders.rules` et le conflit de port CDC unique. Le matériel correspondant
+(aimants diamétraux, breakouts, RP2040) est listé dans `archive-v2/HARDWARE.md`.
+
+Conservé pour mémoire, **pas maintenu**.
+
+## Projet voisin
+
+La station qui reçoit ce flux fait l'objet d'un dépôt distinct, `UnrealCAMERA`, où une
+**voie concurrente** est en production : SteamVR + OpenXR, qui exige un casque pour démarrer
+son compositeur. Les deux approches visent le même résultat ; celle-ci s'affranchit du
+casque, celle-là est prouvée jusqu'aux poses.

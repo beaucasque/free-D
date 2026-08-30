@@ -1,0 +1,32 @@
+# Service utilisateur pour le bridge Free-D (v3, trois trackers Vive).
+#
+# Installation :
+#   mkdir -p ~/.config/systemd/user
+#   cp system/vp-bridge.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now vp-bridge
+#
+# Journal :  journalctl --user -u vp-bridge -f
+#
+# Plus de port serie : le piege du CDC unique du RP2040 a disparu avec les
+# encodeurs. Ce service n'entre plus en conflit avec quoi que ce soit.
+#
+# Il lit bridge/axes.json. Si le fichier manque ou si un axe n'est pas
+# calibre, le bridge sort en erreur plutot que d'emettre des valeurs fausses,
+# et systemd le relance en boucle : c'est voulu, ca se voit dans le journal.
+
+[Unit]
+Description=Bridge tracking Free-D (3 trackers Vive) vers Unreal
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/free-D/bridge
+ExecStart=%h/free-D/bridge/vp_bridge.py --source survive --host 127.0.0.1 --rate 60
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
