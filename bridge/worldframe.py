@@ -294,6 +294,13 @@ def read_lighthouses(path=None):
         grp = cfg.get("lighthouse%d" % i)
         pos = None
         if isinstance(grp, dict) and grp.get("pose"):
+            # OOTXSet dit que la calibration usine a ete recue ; PositionSet
+            # dit que la GEOMETRIE est resolue. Les deux sont independants :
+            # au demarrage libsurvive ecrit un groupe complet avec OOTXSet=1
+            # et une pose encore toute a zero. La prendre pour argent
+            # comptant placerait une base station a l'origine du plateau.
+            if str(grp.get("PositionSet", "1")) not in ("1", "true", "True"):
+                continue
             pos = list(grp["pose"])[:3]
         else:
             # Repli sur la forme plate, si une autre version l'ecrivait ainsi.
@@ -303,9 +310,14 @@ def read_lighthouses(path=None):
         if not pos or len(pos) < 3:
             continue
         try:
-            out["LH%d" % i] = [float(x) for x in pos]
+            v = [float(x) for x in pos]
         except (TypeError, ValueError):
             continue
+        # Filet : une pose exactement nulle n'est pas une position, c'est un
+        # emplacement pas encore rempli.
+        if all(abs(x) < 1e-12 for x in v):
+            continue
+        out["LH%d" % i] = v
     return out
 
 
@@ -478,7 +490,8 @@ if __name__ == "__main__":
     def _grp(i, pos, quat=(1.0, 0.0, 0.0, 0.0)):
         arr = ",".join('"%.12f"' % v for v in list(pos) + list(quat))
         return ('"lighthouse%d":{\n"index":"%d",\n"id":"21546783%d",\n'
-                '"mode":"0",\n"pose":[%s]\n}\n' % (i, i, i, arr))
+                '"mode":"0",\n"pose":[%s],\n"OOTXSet":"1",\n'
+                '"PositionSet":"1"\n}\n' % (i, i, i, arr))
 
     fake = ('"v":"0",\n"poser":"MPFIT",\n"disambiguator":"StateBased"\n'
             + _grp(0, (2.1, -2.6, 2.45)) + _grp(1, (2.1, 2.6, 2.45)))
@@ -500,6 +513,19 @@ if __name__ == "__main__":
     assert abs(got["LH1"][2] - 2.45) < 1e-9, got
     print("[config]   libsurvive : 2 base stations lues malgre un fichier "
           "sans accolades")
+
+    # Cas rencontre a la premiere mise sous tension : OOTX recu mais
+    # geometrie pas encore resolue. libsurvive ecrit alors un groupe complet
+    # avec une pose toute a zero et PositionSet=0. Ne rien renvoyer.
+    half = ('"v":"0",\n"poser":"MPFIT"\n'
+            '"lighthouse0":{\n"index":"0",\n'
+            '"pose":["0.000000000000","0.000000000000","0.000000000000",'
+            '"0.000000000000","0.000000000000","0.000000000000",'
+            '"0.000000000000"],\n"OOTXSet":"1",\n"PositionSet":"0"\n}\n')
+    with open(fp, "w") as fh:
+        fh.write(half)
+    assert read_lighthouses(fp) == {}, "PositionSet=0 : rien attendu"
+    print("[config]   OOTX recu mais geometrie non resolue : ignore")
 
     with open(fp, "w") as fh:
         fh.write('"v":"0",\n"poser":"MPFIT"\n')

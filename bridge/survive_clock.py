@@ -313,7 +313,11 @@ def probe(seconds=12.0):
         print("  3. ~/.config/libsurvive/config.json doit finir par contenir")
         print("     un groupe 'lighthouseN' — sinon rien n'a ete resolu.")
         print()
-        print("Relancer cette sonde une fois une pose obtenue.")
+        print("Si les lignes ci-dessus montrent 'Adding lighthouse' et")
+        print("'Got OOTX packet', les stations SONT vues : il manque juste du")
+        print("temps pour resoudre leur geometrie. Relancer plus longtemps,")
+        print("en deplacant un tracker face aux deux stations :")
+        print("    python3 bridge/survive_clock.py --probe 90")
         return 1
 
     if not clk.raw:
@@ -414,10 +418,24 @@ def selftest():
     print("\nOK — unite detectee, offset cale sur le plancher, replis surs.")
     print("NOTE : ceci ne valide que la logique. Pour savoir si TA version de")
     print("pysurvive expose un horodatage : python3 survive_clock.py --probe")
+    print("Premiere mise sous tension : lui laisser du temps, --probe 90,")
+    print("et deplacer un tracker face aux deux base stations.")
     return 0
 
 
 if __name__ == "__main__":
     if "--probe" in sys.argv:
-        sys.exit(probe())
+        # Duree reglable : 12 s suffisent a repondre quand des poses
+        # arrivent deja, mais pas a une PREMIERE mise sous tension. Il faut
+        # alors le temps de recevoir l'OOTX complet des deux base stations
+        # puis de resoudre leur geometrie (PositionSet), ce qui demande
+        # souvent une minute et un tracker qu'on deplace.
+        secs = 12.0
+        i = sys.argv.index("--probe")
+        if i + 1 < len(sys.argv):
+            try:
+                secs = float(sys.argv[i + 1])
+            except ValueError:
+                pass
+        sys.exit(probe(secs))
     sys.exit(selftest())
