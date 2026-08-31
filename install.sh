@@ -152,28 +152,52 @@ if [ "$DO_LIBSURVIVE" = 1 ]; then
     say "libsurvive et pysurvive"
     info "hors PyPI : compile depuis les sources, comme dit requirements.txt"
 
-    if [ -d "$LIBSURVIVE_DIR/.git" ]; then
-        info "depot deja clone, mise a jour"
-        run git -C "$LIBSURVIVE_DIR" pull --ff-only
+    # Rien a recompiler si le venv importe deja pysurvive : la compilation
+    # dure plusieurs minutes et le script se veut relancable.
+    if [ "$DRY" = 0 ] && [ -x "$PY" ] \
+       && "$PY" -c "import pysurvive" >/dev/null 2>&1; then
+        info "pysurvive deja installe dans le venv — compilation sautee"
+        info "forcer : $VENV/bin/pip install --no-deps --force-reinstall $LIBSURVIVE_DIR"
     else
-        run mkdir -p "$(dirname "$LIBSURVIVE_DIR")"
-        run git clone --recursive https://github.com/collabora/libsurvive "$LIBSURVIVE_DIR"
+        if [ -d "$LIBSURVIVE_DIR/.git" ]; then
+            info "depot deja clone, mise a jour"
+            run git -C "$LIBSURVIVE_DIR" pull --ff-only
+        else
+            run mkdir -p "$(dirname "$LIBSURVIVE_DIR")"
+            run git clone --recursive https://github.com/collabora/libsurvive "$LIBSURVIVE_DIR"
+        fi
+
+        # Dans le venv, pas sur le systeme : c'est ce python-la que le bridge
+        # et la console utiliseront.
+        #
+        # --no-deps est indispensable. Le setup.py de libsurvive declare
+        # install_requires=['gooey'], qui tire wxPython, qui se compile depuis
+        # les sources et echoue sans les en-tetes GTK3 — faisant echouer TOUTE
+        # l'installation alors que pysurvive, lui, avait compile. Or free-D
+        # n'en a aucun besoin : gooey n'est importe que par
+        # pysurvive/__main__.py, l'entree GUI, et matplotlib/scipy seulement
+        # par recorder.py. `import pysurvive` ne demande que la bibliotheque
+        # standard et les bindings ctypes generes. Le §6 du handoff pose
+        # d'ailleurs l'absence de dependance GUI comme une regle.
+        run "$VENV/bin/pip" install --no-deps "$LIBSURVIVE_DIR"
     fi
 
-    # Dans le venv, pas sur le systeme : c'est ce python-la que le bridge et
-    # la console utiliseront.
-    run "$VENV/bin/pip" install "$LIBSURVIVE_DIR"
-
-    # Sans cette regle, les trackers ne sont lisibles que par root et
-    # libsurvive ne voit aucun peripherique.
+    # La regle udev est posee DANS TOUS LES CAS, meme quand la compilation a
+    # ete sautee : pysurvive peut tres bien etre installe alors que la regle
+    # ne l'est pas — c'est exactement ce qui arrive apres un echec sur
+    # wxPython, qui interrompait le script avant cette etape.
     rules="$LIBSURVIVE_DIR/useful_files/81-vive.rules"
     if [ "$DRY" = 1 ] || [ -f "$rules" ]; then
         say "Regle udev"
-        info "sans elle les trackers ne sont accessibles qu'a root"
-        run sudo install -m 0644 "$rules" /etc/udev/rules.d/81-vive.rules
-        run sudo udevadm control --reload-rules
-        run sudo udevadm trigger
-        info "debrancher/rebrancher les trackers pour que la regle prenne effet"
+        if [ "$DRY" = 0 ] && cmp -s "$rules" /etc/udev/rules.d/81-vive.rules 2>/dev/null; then
+            info "deja posee et identique"
+        else
+            info "sans elle les trackers ne sont accessibles qu'a root"
+            run sudo install -m 0644 "$rules" /etc/udev/rules.d/81-vive.rules
+            run sudo udevadm control --reload-rules
+            run sudo udevadm trigger
+            info "debrancher/rebrancher les trackers pour que la regle prenne effet"
+        fi
     else
         warn "81-vive.rules introuvable dans $LIBSURVIVE_DIR/useful_files/"
         warn "les trackers risquent de n'etre lisibles que par root"

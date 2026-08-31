@@ -40,6 +40,7 @@ Depuis le Mac :  ssh -L 8410:localhost:8410 unreal
 import argparse
 import json
 import math
+import collections
 import os
 import shutil
 import sys
@@ -145,6 +146,8 @@ class Hub:
         self.tap = None
         self.phase = "libre"
         self.phase_t0 = None
+        self._wf = None          # repere plateau precalcule pour la vue de
+        self._wf_key = None      # dessus ; recalcule quand world change
         self.done = []
         self.ref = None
         self.msg = ""
@@ -192,9 +195,13 @@ class Hub:
         with self.lock:
             d = self.dev.get(dev)
             if d is None:
-                d = self.dev[dev] = {"travel": 0.0, "pos": pos, "n": 0}
+                d = self.dev[dev] = {"travel": 0.0, "pos": pos, "n": 0,
+                                     # instants d'echantillonnage : debit et
+                                     # detection de decrochage
+                                     "ts": collections.deque(maxlen=400)}
             else:
                 d["travel"] += math.dist(pos, d["pos"])
+            d["ts"].append(t)
             d.update(pos=pos, quat=quat, t=t)
             d["n"] += 1
 
@@ -456,10 +463,52 @@ class Hub:
     def snapshot(self):
         with self.lock:
             now = time.monotonic()
+            # Repere plateau precalcule, pour situer les trackers sur la
+            # vue de dessus. Refait seulement quand world change d'identite.
+            if self.world is not None and self._wf_key is not self.world:
+                try:
+                    self._wf = worldframe.prepare(dict(self.world))
+                    self._wf_key = self.world
+                except Exception:                        # noqa: BLE001
+                    self._wf, self._wf_key = None, self.world
+
             devs = []
             for k, d in sorted(self.dev.items()):
+                ts = d.get("ts")
+                rate = gap = 0.0
+                drops = 0
+                if ts and len(ts) > 4:
+                    span = ts[-1] - ts[0]
+                    if span > 1e-3:
+                        rate = (len(ts) - 1) / span
+                    # Un trou dans les instants d'echantillonnage est un
+                    # decrochage optique : le tracker n'a rien vu. C'est ce
+                    # qui coute un tour sur un axe multi-tour (§10).
+                    prev = None
+                    for x in ts:
+                        if prev is not None:
+                            dt = x - prev
+                            if dt > gap:
+                                gap = dt
+                            if dt > 0.1:
+                                drops += 1
+                        prev = x
+
+                xy = None
+                if self._wf is not None:
+                    try:
+                        f = worldframe.apply(self._wf, d["pos"],
+                                             d.get("quat") or (1.0, 0, 0, 0))
+                        xy = [round(f[0], 3), round(f[1], 3), round(f[2], 3)]
+                    except Exception:                    # noqa: BLE001
+                        xy = None
+
                 devs.append({"id": k, "travel": round(d["travel"], 2),
                              "age_ms": (now - d["t"]) * 1000.0,
+                             "rate": round(rate, 1),
+                             "gap_ms": round(gap * 1000.0, 1),
+                             "drops": drops,
+                             "xy": xy,
                              "role": ("camera" if k == self.camera else
                                       next((n for n, c in self.axes.items()
                                             if c.get("device") == k), ""))})
@@ -495,6 +544,31 @@ class Hub:
             out["ref_ok"] = self.ref is not None
             out["cam_rate"] = math.degrees(self.hist.rate())
             out["test"] = self._test_snapshot() if self.tap else None
+
+            # Verdict de sante, pour le bandeau permanent. Le pire des
+            # trackers commande : c'est lui qui gatera la mesure.
+            assigned = [d for d in devs if d["role"]]
+            watch = assigned or devs
+            out["health"] = {
+                "clock_ok": self.clock.scale is not None,
+                "n_dev": len(devs),
+                "n_assigned": len(assigned),
+                "worst_age_ms": round(max([d["age_ms"] for d in watch],
+                                          default=0.0), 1),
+                "worst_gap_ms": round(max([d["gap_ms"] for d in watch],
+                                          default=0.0), 1),
+                "min_rate": round(min([d["rate"] for d in watch],
+                                      default=0.0), 1),
+                "drops": sum(d["drops"] for d in watch),
+                "lh_seen": len(self.lighthouses or {}),
+                # Un axes.json produit en --demo reste sur le disque et sera
+                # relu au demarrage suivant, bridge compris. Le dire fort
+                # plutot que de laisser croire a une calibration reelle.
+                "demo_cal": any(
+                    str(v).startswith("DEMO-")
+                    for v in [self.camera] + [c.get("device")
+                                              for c in self.axes.values()]),
+            }
             return out
 
     def _test_snapshot(self):
@@ -669,6 +743,17 @@ ol.ph li.done::before{content:"✓";color:var(--ok)}
 ol.ph li.key b{color:var(--naif)}
 ol.ph b{font-weight:500;display:block}
 ol.ph small{color:var(--dim);font-size:11.5px;line-height:1.35}
+.hb{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+  padding:7px 16px;border-bottom:1px solid var(--rule);
+  background:var(--panel2);font-size:12px;
+  font-family:"Ubuntu Mono",monospace}
+.hb .lamp{width:8px;height:8px;border-radius:50%;display:inline-block;
+  margin-right:6px;vertical-align:1px}
+.hb .chip{padding:2px 8px;border:1px solid var(--rule);border-radius:10px;
+  color:var(--dim);white-space:nowrap}
+.hb .chip b{color:var(--ink);font-weight:600}
+.hb .alarm{color:var(--bad);border-color:var(--bad)}
+.hb .warn2{color:var(--warn);border-color:var(--warn)}
 .bar{padding:9px 16px;border-top:1px solid var(--rule);background:var(--panel2);
  color:var(--dim);font-size:12.5px}
 .note{color:var(--dim);font-size:12.5px;line-height:1.5}
@@ -681,6 +766,10 @@ ol.ph small{color:var(--dim);font-size:11.5px;line-height:1.35}
   <div class="tab" data-t="test">Test<span class="chk" id="c-test"></span></div>
   <div style="margin-left:auto" class="eyebrow" id="hdr"></div>
 </header>
+
+<!-- Bandeau de sante : hors des onglets, donc toujours visible. Il dit si
+     le TRACKING va mal, avant que ca ne se voie dans une mesure. -->
+<div class="hb" id="hb"><span class="chip">en attente…</span></div>
 
 <main>
 <!-- ------------------------------------------------- STUDIO -->
@@ -821,7 +910,55 @@ ev.onmessage=e=>{const s=JSON.parse(e.data);last=s;
   $("c-test").textContent=s.tab_ready.test?"✓":"";
   $("hdr").textContent=(s.camera?("caméra "+s.camera+" · "):"")+(s.clock||"");
   $("hdr").style.color=s.clock_ok?"var(--dim)":"var(--warn)";
-  devices(s);studio(s);axes(s);test(s)};
+  health(s);devices(s);studio(s);axes(s);test(s)};
+
+// Bandeau de sante. Le pire tracker commande : c'est lui qui gatera la
+// mesure, et une moyenne le cacherait. Quand des roles sont attribues, on
+// ne juge que les trackers en service — les controleurs poses au sol n'ont
+// pas a declencher d'alarme.
+function health(s){
+  const H=s.health;if(!H)return;
+  const box=$("hb");const c=[];
+  const lamp=k=>'<span class="lamp" style="background:'+k+'"></span>';
+  const ok="var(--ok)",wr="var(--warn)",bd="var(--bad)";
+
+  // horloge — le §6bis en fait la condition de tout le reste
+  c.push('<span class="chip'+(H.clock_ok?'':' warn2')+'">'
+    +lamp(H.clock_ok?ok:wr)+(s.clock||"horloge inconnue")+'</span>');
+
+  // trackers vus / en service
+  c.push('<span class="chip'+(H.n_dev?'':' alarm')+'">'+lamp(H.n_dev?ok:bd)
+    +'<b>'+H.n_dev+'</b> appareils'
+    +(H.n_assigned?(' · <b>'+H.n_assigned+'</b> en service'):'')+'</span>');
+
+  // debit du plus lent
+  const rl=H.min_rate>=100?ok:(H.min_rate>=40?wr:bd);
+  c.push('<span class="chip'+(rl===ok?'':(rl===wr?' warn2':' alarm'))+'">'
+    +lamp(rl)+'débit min <b>'+H.min_rate.toFixed(0)+'</b> Hz</span>');
+
+  // fraicheur de la pose la plus vieille
+  const al=H.worst_age_ms<50?ok:(H.worst_age_ms<200?wr:bd);
+  c.push('<span class="chip'+(al===ok?'':(al===wr?' warn2':' alarm'))+'">'
+    +lamp(al)+'pose la + vieille <b>'+H.worst_age_ms.toFixed(0)+'</b> ms</span>');
+
+  // decrochages : ce qui coute un tour sur un axe multi-tour
+  const dl=H.drops===0?ok:bd;
+  c.push('<span class="chip'+(dl===ok?'':' alarm')+'">'+lamp(dl)
+    +'décrochages <b>'+H.drops+'</b>'
+    +(H.worst_gap_ms>20?(' · trou '+H.worst_gap_ms.toFixed(0)+' ms'):'')
+    +'</span>');
+
+  // base stations lues dans la config libsurvive
+  c.push('<span class="chip'+(H.lh_seen>=2?'':' warn2')+'">'
+    +lamp(H.lh_seen>=2?ok:wr)+'<b>'+H.lh_seen+'</b> base stations</span>');
+
+  // une calibration de demo sur le disque serait relue par le bridge
+  if(H.demo_cal)
+    c.push('<span class="chip alarm">'+lamp(bd)
+      +'CALIBRATION DE DÉMO chargée — ne pas s\'y fier</span>');
+
+  box.innerHTML=c.join("");
+}
 
 function devices(s){
   const tb=$("devs");const sel=new Set([...tb.querySelectorAll("tr.sel")]
@@ -971,6 +1108,16 @@ function drawTop(){
   const k=Math.min((w-60)/maxX,(h-50)/(2*maxY));
   const ox=34,oy=h/2;
   const X=x=>ox+x*k, Y=y=>oy-y*k;
+  // Grille au metre : donne l'echelle, qu'aucun chiffre ne remplace quand
+  // on cherche a savoir si la camera a la place de reculer.
+  g.strokeStyle="#23272e";g.lineWidth=1;
+  for(let m=0;m<=Math.ceil(maxX);m++){
+    g.beginPath();g.moveTo(X(m),Y(-maxY));g.lineTo(X(m),Y(maxY));g.stroke()}
+  for(let m=-Math.ceil(maxY);m<=Math.ceil(maxY);m++){
+    g.beginPath();g.moveTo(X(0),Y(m));g.lineTo(X(maxX),Y(m));g.stroke()}
+  g.fillStyle="#4a515c";g.font='9px "Ubuntu Mono",monospace';
+  for(let m=1;m<=Math.ceil(maxX);m++)g.fillText(m+"m",X(m)+2,Y(-maxY)-3);
+
   g.strokeStyle="#2b3038";g.beginPath();g.moveTo(X(0),Y(0));g.lineTo(w-8,Y(0));
   g.stroke();
   g.strokeStyle="#4a8f5a";g.lineWidth=5;g.beginPath();
@@ -984,6 +1131,21 @@ function drawTop(){
     g.fillStyle="#e05c5c";g.beginPath();g.arc(X(v[0]),Y(v[1]),5,0,7);g.fill();
     g.fillStyle="#8b929e";g.font='10px "Ubuntu Mono",monospace';
     g.fillText(kk+" "+v[2].toFixed(1)+"m",X(v[0])+8,Y(v[1])-6)}
+  // Position VIVANTE des trackers, dans le repere plateau. La pastille
+  // cyan ci-dessus est la camera au moment du releve ; celles-ci bougent.
+  // Voir ou est reellement la camera pendant la phase Test evite de
+  // confondre "le decouplage fuit" et "je suis sorti du volume".
+  if(s.devices)for(const d of s.devices){
+    if(!d.xy)continue;
+    const col=d.role==="camera"?"#4fc3d9":(d.role?"#7fbf6a":"#5a616c");
+    const r=d.role?5:3;
+    g.fillStyle=col;g.beginPath();g.arc(X(d.xy[0]),Y(d.xy[1]),r,0,7);g.fill();
+    if(d.role){
+      g.fillStyle="#8b929e";g.font='10px "Ubuntu Mono",monospace';
+      g.fillText(d.role+" "+d.xy[2].toFixed(2)+"m",
+                 X(d.xy[0])+8,Y(d.xy[1])+11)}
+  }
+
   g.fillStyle="#8b929e";g.font='11px "Ubuntu Mono",monospace';
   g.fillText("écran",X(0)-26,Y(wd/2)-8);
   g.fillText("caméra "+dc.toFixed(2)+" m",X(dc)-30,Y(lat)+20);

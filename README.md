@@ -62,7 +62,8 @@ bridge/      la chaîne temps réel
   vp_bridge.py       3 trackers → Free-D, applique world.json et axes.json
   requirements.txt   numpy >= 1.24 (plus pysurvive, hors PyPI)
 tools/       calibration et diagnostic
-  vp-console.py      serveur web, 3 onglets — Studio, Objectifs, Test
+  vp-console.py      serveur web, 3 onglets — Studio, Objectifs, Test,
+                     avec bandeau de santé permanent et vue de dessus vivante
   calib-world.py     équivalent CLI de l'onglet Studio
   calib-axis.py      équivalent CLI de l'onglet Objectifs
   test-decouple.py   équivalent CLI de l'onglet Test
