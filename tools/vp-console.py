@@ -957,6 +957,12 @@ canvas{width:100%;display:block;background:#171a1f;border:1px solid var(--rule);
  border-radius:2px}
 .kv{display:flex;justify-content:space-between;padding:4px 0;
  border-bottom:1px solid var(--rule)}
+/* Lignes de releve : le libelle s'allongeait jusqu'a toucher le compteur.
+   Grille explicite — libelle souple, compteur et bouton a largeur fixe. */
+#slots .kv{display:grid;grid-template-columns:1fr auto auto;gap:10px;
+ align-items:center;font-size:12.5px;line-height:1.3}
+#slots .kv b{font-size:12.5px;min-width:2ch;text-align:right}
+#slots .kv button{padding:5px 10px;font-size:11px}
 .kv b{font-weight:400;font-family:"Ubuntu Mono",monospace}
 .big{font-size:21px}
 .v-OK{color:var(--ok)}.v-PASSABLE{color:var(--warn)}.v-REFAIRE{color:var(--bad)}
@@ -1032,7 +1038,7 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
     </div>
   </div>
   <div>
-    <div class="card"><h3>Vue de dessus</h3><canvas id="top" height="330"></canvas>
+    <div class="card"><h3>Vue de dessus</h3><canvas id="top" height="260"></canvas>
       <p class="note" style="margin:9px 0 0">+X va de l'écran vers la caméra —
       ta ligne médiane. Le repère est ancré sur l'écran : le déport de la
       caméra est mesuré, pas annulé.</p></div>
@@ -1450,8 +1456,20 @@ function test(s){
    .map(([a,b])=>`<div class="kv"><span>${a}</span><b>${b}</b></div>`).join("");
 }
 
-function prep(cv){const r=devicePixelRatio||1,w=cv.clientWidth,h=cv.height;
- if(cv.width!==w*r){cv.width=w*r;cv.height=h*r}
+// cv.height est la taille du TAMPON de rendu, pas la hauteur affichee. La
+// version precedente faisait h=cv.height puis cv.height=h*r : sur un ecran
+// retina (devicePixelRatio 2) le canvas se retrouvait avec un tampon de 660
+// px et, faute de hauteur CSS, s'affichait a 660 px de haut au lieu de 330.
+// D'ou une vue de dessus deux fois trop grande sur Mac, normale ailleurs.
+// On memorise donc la hauteur voulue une fois, on la pose en CSS, et le
+// tampon en est deduit.
+function prep(cv){
+ const r=devicePixelRatio||1;
+ if(!cv.dataset.h)cv.dataset.h=cv.getAttribute("height")||cv.height;
+ const h=+cv.dataset.h,w=cv.clientWidth;
+ if(cv.style.height!==h+"px")cv.style.height=h+"px";
+ const bw=Math.round(w*r),bh=Math.round(h*r);
+ if(cv.width!==bw||cv.height!==bh){cv.width=bw;cv.height=bh}
  const g=cv.getContext("2d");g.setTransform(r,0,0,r,0,0);g.clearRect(0,0,w,h);
  return[g,w,h]}
 
