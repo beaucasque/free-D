@@ -1057,10 +1057,18 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
         <button class="go" id="b-sw-start">Démarrer</button>
         <button class="stop" id="b-sw-stop">Arrêter</button>
       </div>
+      <p class="note"><b>Deux passes.</b> Un axe à la fois : choisis
+      « focus », balaie, enregistre — puis reviens ici, choisis « zoom » et
+      recommence avec l'autre tracker. Chaque bague a le sien.</p>
       <p class="note">Caméra immobile sur trépied. Butée à butée, lentement.</p>
     </div>
     <div class="card"><h3>Axes enregistrés</h3>
-      <table><tbody id="axlist"></tbody></table></div>
+      <table><tbody id="axlist"></tbody></table>
+      <p class="note">Les deux sont nécessaires. Le §2 impose de monter les
+      trackers d'objectif <b>un de chaque côté</b> du bloc optique : du même
+      côté, le corps caméra masquerait une base station à chacun, et la
+      redondance disparaîtrait là où un décrochage coûte le plus cher.</p>
+      </div>
   </div>
   <div>
     <div class="card"><h3>Angle relevé</h3><canvas id="sweep" height="220"></canvas></div>
@@ -1318,8 +1326,12 @@ function devices(s){
     tb.appendChild(tr)}
   for(const id of ["sel-cam","sel-lens"]){
     const e=$(id),cur=e.value;e.innerHTML="";
-    s.devices.forEach(d=>e.appendChild(el("option",null,d.id)));
-    if(cur)e.value=cur}
+    // Le tracker camera ne peut pas servir d'axe d'objectif : la console le
+    // refuse de toute facon, autant ne pas le proposer.
+    const list = id==="sel-lens" && s.camera
+      ? s.devices.filter(d=>d.id!==s.camera) : s.devices;
+    list.forEach(d=>e.appendChild(el("option",null,d.id)));
+    if(cur && list.some(d=>d.id===cur)) e.value=cur}
 }
 
 function studio(s){
@@ -1352,12 +1364,24 @@ function studio(s){
 }
 
 function axes(s){
+  // On liste les DEUX axes attendus, calibres ou non. Une table vide ne
+  // disait pas qu'il faut repasser une seconde fois : le balayage se fait un
+  // axe a la fois, focus puis zoom, en changeant le menu « Axe ».
   const tb=$("axlist");tb.innerHTML="";
-  for(const k in s.axes){const a=s.axes[k],tr=el("tr");
+  for(const k of ["focus","zoom"]){
+    const a=s.axes[k],tr=el("tr");
     tr.appendChild(el("td",null,k));
-    tr.appendChild(el("td","mono",a.device||"—"));
-    tr.appendChild(el("td","mono",(a.span||0).toFixed(0)+"°"
-      +(a.multiturn?" ⟳":"")));tb.appendChild(tr)}
+    if(a){
+      tr.appendChild(el("td","mono",a.device||"—"));
+      tr.appendChild(el("td","mono",(a.span||0).toFixed(0)+"°"
+        +(a.multiturn?" ⟳":"")));
+      const ok=el("td");ok.style.color="var(--ok)";ok.textContent="✓";
+      tr.appendChild(ok);
+    }else{
+      const td=el("td","dim","à calibrer");td.colSpan=3;
+      tr.appendChild(td);
+    }
+    tb.appendChild(tr)}
   if(s.sweep){$("msg").textContent=s.sweep.name+" — "+s.sweep.n
     +" échantillons, "+s.sweep.s.toFixed(0)+" s"}
   const r=s.sweep_result;
