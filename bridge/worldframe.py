@@ -50,6 +50,8 @@ CONVENTION
 import json
 import math
 import os
+import re
+import shutil
 
 import numpy as np
 
@@ -229,25 +231,81 @@ def build(normal, p_left, p_right, p_camera, floor_offset_mm=0.0):
     }
 
 
+def _parse_survive_config(text):
+    """Le config.json de libsurvive n'est PAS du JSON valide.
+
+    survive_config.c ecrit le groupe racine avec write_config_group(f, cg,
+    NULL) : le tag etant NULL, aucune accolade englobante n'est emise. Les
+    groupes lighthouse qui suivent ont un tag, donc des accolades, mais rien
+    n'insere de virgule entre le groupe racine et eux, ni entre deux
+    lighthouses. Le fichier ressemble a ceci :
+
+        "v":"0",
+        "poser":"MPFIT",
+        "disambiguator":"StateBased"
+        "lighthouse0":{
+        "index":"0",
+        "pose":["2.100000000000","-2.600000000000",...]
+        }
+
+    Un json.load() dessus echoue TOUJOURS. C'est ce qui faisait renvoyer un
+    dictionnaire vide meme quand les base stations etaient resolues — et la
+    demo ne pouvait pas le montrer, puisqu'elle injecte les lighthouses
+    directement sans passer par ce fichier.
+
+    On restaure donc les virgules manquantes devant chaque ouverture de
+    groupe, puis on englobe le tout.
+    """
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
+        if (re.match(r'^"[^"]+"\s*:\s*\{$', ln) and out
+                and not out[-1].endswith((",", "{"))):
+            out[-1] += ","
+        out.append(ln)
+    return json.loads("{" + "\n".join(out) + "}")
+
+
 def read_lighthouses(path=None):
     """Poses des base stations, lues dans la config de libsurvive.
 
     libsurvive resout la geometrie des lighthouses tout seul et l'ecrit la.
     On n'en a pas besoin pour tracker — c'est un diagnostic d'installation.
+
+    La position est dans le groupe "lighthouseN", champ "pose" : sept
+    valeurs, position puis quaternion (config_set_lighthouse dans
+    survive_config.c). Ce n'est pas une cle plate "lighthouseN_position", et
+    json_helpers.c ecrit tous les nombres comme des CHAINES : la conversion
+    est a notre charge.
     """
     if path is None:
         path = os.path.expanduser("~/.config/libsurvive/config.json")
     if not os.path.exists(path):
         return {}
     try:
-        cfg = json.load(open(path))
+        cfg = _parse_survive_config(open(path).read())
     except (ValueError, OSError):
         return {}
+
     out = {}
     for i in range(4):
-        k = "lighthouse%d_position" % i
-        if k in cfg and cfg[k]:
-            out["LH%d" % i] = [float(x) for x in cfg[k]]
+        grp = cfg.get("lighthouse%d" % i)
+        pos = None
+        if isinstance(grp, dict) and grp.get("pose"):
+            pos = list(grp["pose"])[:3]
+        else:
+            # Repli sur la forme plate, si une autre version l'ecrivait ainsi.
+            flat = cfg.get("lighthouse%d_position" % i)
+            if flat:
+                pos = list(flat)[:3]
+        if not pos or len(pos) < 3:
+            continue
+        try:
+            out["LH%d" % i] = [float(x) for x in pos]
+        except (TypeError, ValueError):
+            continue
     return out
 
 
@@ -409,4 +467,45 @@ if __name__ == "__main__":
         print("[garde]    coins d'ecran trop proches : refuse")
     else:
         raise AssertionError("aurait du refuser")
+
+    # --- lecture de la config libsurvive ------------------------------
+    # On reconstruit ce que survive_config.c ECRIT REELLEMENT : groupe
+    # racine sans accolades, groupes lighthouse entre accolades mais sans
+    # virgule avant eux, tous les nombres en chaines ("%.12f" entre
+    # guillemets, json_helpers.c).
+    import tempfile
+
+    def _grp(i, pos, quat=(1.0, 0.0, 0.0, 0.0)):
+        arr = ",".join('"%.12f"' % v for v in list(pos) + list(quat))
+        return ('"lighthouse%d":{\n"index":"%d",\n"id":"21546783%d",\n'
+                '"mode":"0",\n"pose":[%s]\n}\n' % (i, i, i, arr))
+
+    fake = ('"v":"0",\n"poser":"MPFIT",\n"disambiguator":"StateBased"\n'
+            + _grp(0, (2.1, -2.6, 2.45)) + _grp(1, (2.1, 2.6, 2.45)))
+
+    tmpd = tempfile.mkdtemp(prefix="wf-selftest-")
+    fp = os.path.join(tmpd, "config.json")
+    with open(fp, "w") as fh:
+        fh.write(fake)
+
+    try:
+        json.loads(fake)
+        raise AssertionError("ce format serait donc du JSON valide ?")
+    except ValueError:
+        pass
+
+    got = read_lighthouses(fp)
+    assert set(got) == {"LH0", "LH1"}, got
+    assert abs(got["LH0"][1] + 2.6) < 1e-9, got
+    assert abs(got["LH1"][2] - 2.45) < 1e-9, got
+    print("[config]   libsurvive : 2 base stations lues malgre un fichier "
+          "sans accolades")
+
+    with open(fp, "w") as fh:
+        fh.write('"v":"0",\n"poser":"MPFIT"\n')
+    assert read_lighthouses(fp) == {}, "config nue : rien attendu"
+    assert read_lighthouses(os.path.join(tmpd, "absent.json")) == {}
+    print("[config]   config nue ou absente : {} sans exception")
+    shutil.rmtree(tmpd, ignore_errors=True)
+
     print("OK — sol, ecran, ligne mediane, camera et base stations coherents.")

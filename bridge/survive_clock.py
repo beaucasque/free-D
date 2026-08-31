@@ -295,8 +295,31 @@ def probe(seconds=12.0):
         clk.feed(read_timecode(u), time.monotonic())
 
     print("%d poses recues." % seen)
+
+    # Zero pose et "pas d'horodatage" sont deux diagnostics differents, et
+    # les confondre envoie chercher en ctypes un probleme qui n'existe
+    # peut-etre pas. Sans pose, la sonde n'a simplement rien eu a horodater.
+    if seen == 0:
+        print("\nVERDICT : AUCUNE POSE — la question de l'horodatage reste")
+        print("entiere, la sonde n'a rien eu a mesurer.")
+        print()
+        print("libsurvive a bien ouvert les trackers (voir les lignes")
+        print("'Adding tracked object' ci-dessus) : l'USB et les droits sont")
+        print("donc bons. Une pose exige en plus que les trackers VOIENT les")
+        print("base stations. A verifier, dans cet ordre :")
+        print("  1. base stations alimentees, temoin allume ;")
+        print("  2. trackers dans leur champ (150 deg H, 110 deg V), face")
+        print("     aux stations, pas a plat sur un bureau ni masques ;")
+        print("  3. ~/.config/libsurvive/config.json doit finir par contenir")
+        print("     un groupe 'lighthouseN' — sinon rien n'a ete resolu.")
+        print()
+        print("Relancer cette sonde une fois une pose obtenue.")
+        return 1
+
     if not clk.raw:
         print("\nVERDICT : AUCUN horodatage exploitable.")
+        print("(%d poses recues, donc le probleme est bien l'horodatage.)"
+              % seen)
         print("read_timecode() n'a rien trouve. Chercher du cote de")
         print("survive_simple_object_get_latest_pose() en ctypes, ou d'une")
         print("methode de la liste ci-dessus. Sans ca, le bridge reste sur")
