@@ -67,25 +67,43 @@ tools/       calibration et diagnostic
   calib-axis.py      équivalent CLI de l'onglet Objectifs
   test-decouple.py   équivalent CLI de l'onglet Test
 system/      vp-bridge.service
+install.sh   mise à niveau d'une station : paquets, venv, libsurvive, udev, service
 docs/        HANDOFF-free-D-v5.md — la source de vérité
 archive-v2/  architecture abandonnée, conservée pour mémoire
 ```
 
-## Prérequis
+## Installation
 
 ```bash
-pip install -r bridge/requirements.txt      # numpy
-# puis construire libsurvive et ses bindings Python (pysurvive), hors PyPI
+./install.sh                # paquets, venv, libsurvive, service, auto-tests
+./install.sh --dry-run      # ce qu'il ferait, sans rien exécuter
 ```
 
-Sur une Ubuntu Studio nue, `pip` et `venv` peuvent manquer :
-`sudo apt install python3-venv python3-numpy` avant tout le reste.
+Il est idempotent et **n'active aucun service** : libsurvive est exclusif, et le bridge
+sort en erreur tant que `axes.json` n'existe pas. Options utiles : `--skip-apt`,
+`--skip-libsurvive` (venv et numpy seuls, suffisant pour `--demo`), `--check` pour
+relancer les huit auto-tests.
+
+Ce qu'il installe, et pourquoi c'est plus qu'un `pip install` :
+
+- les paquets système, dont **`python3-venv`** — une Ubuntu Studio nue n'a ni `pip` ni
+  `venv`, et `python3 -m venv` échoue alors sur `ensurepip` ;
+- le venv dans `.venv/`, puis numpy ;
+- **libsurvive et pysurvive**, compilés depuis les sources : hors PyPI, avec leurs
+  dépendances de build ;
+- la règle udev **`81-vive.rules`**, sans laquelle les trackers ne sont lisibles que par
+  root et libsurvive ne voit aucun périphérique ;
+- le bit exécutable sur les scripts, que le service et les commandes ci-dessous supposent ;
+- l'unité systemd utilisateur, réécrite pour pointer sur **l'interpréteur du venv** :
+  systemd n'active pas d'environnement, donc le shebang `env python3` du bridge trouverait
+  le python système, sans numpy ni pysurvive.
 
 Les trackers doivent être en **USB filaire direct** — libsurvive ne sait pas appairer.
 
 ## Démarrage
 
 ```bash
+source .venv/bin/activate
 tools/vp-console.py --selftest      # ~30 s, sans rien brancher
 systemctl --user stop vp-bridge     # libsurvive est exclusif : un seul processus
 tools/vp-console.py --demo          # l'interface, sans matériel

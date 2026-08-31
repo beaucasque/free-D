@@ -6,3 +6,6 @@ bridge/world.json
 
 __pycache__/
 *.pyc
+
+# Environnement Python cree par install.sh.
+.venv/
