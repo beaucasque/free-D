@@ -67,6 +67,19 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# ------------------------------------------------------- 0. surtout pas root
+
+# Lance sous sudo, $HOME devient /root : le venv serait crée root dans le
+# depot (plus writable par l'utilisateur), libsurvive irait dans /root/src,
+# et l'unite systemd UTILISATEUR atterrirait dans /root/.config ou la
+# session de l'utilisateur ne la verrait jamais. Le script demande sudo
+# lui-meme, uniquement pour apt et la regle udev.
+if [ "$(id -u)" = 0 ]; then
+    die "ne pas lancer ce script en root / sous sudo — le lancer comme
+   l'utilisateur normal : il demandera sudo pour apt et la regle udev.
+   Si vous etes vraiment root sans utilisateur, exportez SUDO_USER."
+fi
+
 # ------------------------------------------------------------------ 0. etat
 
 say "Station"
