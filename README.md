@@ -42,14 +42,32 @@ Deux mesures au-delà des auto-tests, faites sur cet arbre :
 constantes que la démo injecte elle-même — le §11 du handoff met en garde contre exactement
 cette lecture. Ce qu'ils ne peuvent pas dire est au §10.
 
-⚠️ En particulier, l'auto-test de `survive_clock.py` valide sa logique de repli sur données
-fabriquées, **pas** la présence réelle d'un horodatage dans ta version de pysurvive. Seule
-la sonde répond, trackers branchés — et c'est la première commande à lancer après la
-première mise sous tension :
+## Première mise sous tension — 31 août 2026
 
-```bash
-python3 bridge/survive_clock.py --probe
-```
+Les trois trackers ont tourné. Ce qui est désormais **mesuré, pas supposé** :
+
+- **L'horodatage existe.** `Pose()[1]` est l'horloge de libsurvive, en **secondes**.
+  52 700 poses en 90 s, retard de file 3,8 ms (p95). C'était la première question ouverte
+  du §10 ; l'intuition du §6bis était juste et rien n'était à changer.
+- **Les deux base stations sont résolues**, au plafond à 2,12 et 2,14 m, de part et
+  d'autre de la médiane, écartées de 4,38 m — la topologie du §2.
+- Trackers `28de:2300` en USB direct, séries `LHR-F3D3F946`, `LHR-BDBF93F3`,
+  `LHR-9A85D671`, sur hub auto-alimenté. Règle udev `81-vive.rules` posée.
+
+Cette mise sous tension a révélé **deux bugs qu'aucun test hors matériel ne pouvait
+voir** — le §11 met en garde contre exactement cette confiance :
+
+- `read_lighthouses()` n'aurait **jamais** lu une base station. Le `config.json` de
+  libsurvive n'est pas du JSON valide (pas d'accolades englobantes, pas de virgule entre
+  groupes), la position est le champ `pose` du groupe `lighthouseN` et non une clé plate,
+  et tous les nombres sont écrits comme des chaînes. Le §4 en dépendait pour orienter la
+  normale du sol et pour le diagnostic d'installation.
+- Une pose de base station **toute à zéro** avec `PositionSet=0` était prise pour une
+  position réelle, plaçant une station à l'origine du plateau.
+
+Restent ouvertes, et hors de portée sans manipulation physique : la **sémantique** de
+l'horodatage (résolution ou balayage — §6bis), le sens de rotation, la course des bagues,
+et `--floor-offset-mm`.
 
 ## Arborescence
 

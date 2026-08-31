@@ -338,9 +338,13 @@ tracking.
 
 ## 10. Questions ouvertes
 
-**Ta version de pysurvive expose-t-elle un horodatage ?** L'auto-test de
-`survive_clock.py` ne valide que sa logique sur données fabriquées : il ne
-peut pas répondre à ça. Une sonde le fait, trackers branchés :
+**~~Ta version de pysurvive expose-t-elle un horodatage ?~~ RÉPONDU — 31 août
+2026.** Oui. `Pose()` renvoie un tuple de longueur 2 dont `[1]` est
+l'horodatage de libsurvive, **en secondes** (échelle 1,0 s par unité).
+Mesuré sur 52 700 poses : retard de file 3,8 ms (p95). L'intuition du §6bis
+était juste, et rien n'est à changer — le bridge et la console l'utilisent
+déjà. La sonde reste utile pour revalider après une mise à jour de
+pysurvive :
 
 ```bash
 python3 bridge/survive_clock.py --probe
@@ -348,7 +352,15 @@ python3 bridge/survive_clock.py --probe
 
 Elle affiche ce que `Pose()` renvoie réellement (type, longueur, contenu de
 chaque élément), la liste des méthodes de l'objet, puis tente de résoudre
-l'horloge sur douze secondes. Trois verdicts possibles :
+l'horloge. La durée est réglable — `--probe 90` — et douze secondes **ne
+suffisent pas** à une première mise sous tension : il faut le temps de
+recevoir l'OOTX des deux base stations puis de résoudre leur géométrie.
+Quatre verdicts possibles :
+
+- *aucune pose* : les trackers sont ouverts mais rien n'est tracké. Si le
+  journal montre `Adding lighthouse` et `Got OOTX packet`, les stations sont
+  vues et il ne manque que du temps — relancer plus longtemps en déplaçant
+  un tracker face aux deux.
 
 - *horloge exploitable — <unité>* : rien à faire, bridge et console
   l'utilisent déjà.
