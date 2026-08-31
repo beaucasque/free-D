@@ -1101,8 +1101,6 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
   </div>
   <div id="scopes"></div>
 </div></div>
-</main>
-
 <!-- ------------------------------------------------- SORTIE -->
 <div class="pane" id="p-out"><div class="grid">
   <div>
@@ -1129,6 +1127,7 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
       ce qui part sur le câble, quantification comprise.</p></div>
   </div>
 </div></div>
+</main>
 
 <div class="bar" id="msg">Prêt.</div>
 
