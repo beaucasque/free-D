@@ -42,6 +42,7 @@ import json
 import math
 import collections
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -78,6 +79,20 @@ PHASES = [
 SLOTS = [("left", "Coin bas GAUCHE de l'ecran"),
          ("right", "Coin bas DROIT de l'ecran"),
          ("camera", "Au sol SOUS la camera")]
+
+
+# libsurvive expose aussi les base stations comme des objets suivis, nommes
+# LH0, LH1... Ce ne sont pas des trackers : leur pose ne se rafraichit pas,
+# et les laisser dans la liste affiche un debit nul et un age de plusieurs
+# dizaines de secondes, qui declenchent de fausses alarmes dans le bandeau.
+# On les ecarte ; le nombre de base stations vient deja de la config
+# libsurvive. Motif strict — LH suivi de chiffres — pour ne pas attraper un
+# numero de serie de tracker, qui commence par "LHR-".
+_LIGHTHOUSE = re.compile(r"^LH\d+$")
+
+
+def is_lighthouse(name):
+    return bool(_LIGHTHOUSE.match(str(name)))
 
 
 def dev_names(obj):
@@ -175,7 +190,7 @@ class Hub:
                     if u is None:
                         break
                     names = dev_names(u)
-                    if not names:
+                    if not names or is_lighthouse(names[0]):
                         continue
                     ps = u.Pose()[0]
                     raw = survive_clock.read_timecode(u)
