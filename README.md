@@ -7,31 +7,49 @@ Chaîne de tracking pour production virtuelle sous Linux : pose 6DoF d'un tracke
 **Ni SteamVR, ni casque, ni compositeur VR.** Le retour vidéo sort en SDI vers un moniteur
 caméra.
 
-Spécification complète : [`docs/HANDOFF-free-D-v4.md`](docs/HANDOFF-free-D-v4.md).
+Spécification complète : [`docs/HANDOFF-free-D-v5.md`](docs/HANDOFF-free-D-v5.md).
 
 ## État — 30 août 2026
 
-**Le code est complet et ses auto-tests passent.** Rien n'a encore tourné sur le matériel
-réel : toute la validation terrain reste à faire.
+**Le code est complet et ses huit auto-tests passent**, tous en code de sortie 0. Rien n'a
+encore tourné sur le matériel réel : toute la validation terrain reste à faire.
 
 ```
-bridge/freed.py           OK — encodage/décodage cohérents, checksum valide
-bridge/lensaxis.py        OK — axe, multi-tour, alignement temporel, chien de garde
-bridge/worldframe.py      OK — sol, écran, ligne médiane, caméra et base stations
-bridge/survive_clock.py   OK — unité détectée, offset calé sur le plancher, replis sûrs
-tools/calib-world.py      OK — trois points suffisent
-tools/test-decouple.py    Chaîne validée — le mouvement caméra est correctement soustrait
+bridge/freed.py                    OK — encodage/décodage, checksum valide
+bridge/lensaxis.py                 OK — axe, multi-tour, alignement temporel, chien de garde
+bridge/worldframe.py               OK — sol, écran, ligne médiane, caméra et base stations
+bridge/survive_clock.py            OK — unité détectée, offset calé sur le plancher, replis sûrs
+tools/calib-axis.py    --selftest  OK — verdicts de montage, absolu/multi-tour, alerte caméra
+tools/calib-world.py   --selftest  OK — trois points suffisent
+tools/test-decouple.py --selftest  OK — le mouvement caméra est correctement soustrait
+tools/vp-console.py    --selftest  OK — les trois onglets enchaînés, gardes actives (~30 s)
 ```
 
-Le chiffre le plus parlant vient du dernier : **alignement temporel 106 fois meilleur que
-le naïf, résidu 0,01 ms** — c'est ce que le §6bis du handoff cherchait à démontrer.
+Le dernier est le seul à exercer la machine à états complète : trois relevés → résolution →
+balayage d'axe → phases de test, refus attendus compris. Les autres ne valident que la math
+de leur module.
 
-⚠️ `calib-axis.py`, `gui-decouple.py` et `vp-console.py` **n'ont pas** de `--selftest`,
-contrairement à ce qu'annonce le §5 du handoff.
+Deux mesures au-delà des auto-tests, faites sur cet arbre :
 
-⚠️ `survive_clock.py` s'exécute en mode démonstration : il valide sa logique de repli, pas
-la présence réelle d'un horodatage exposé par pysurvive. C'est la première question ouverte
-du §10.
+- **Découplage caméra/objectif**, phase roulis lue en direct dans la console en `--demo` :
+  crête naïve 0,726° → alignée 0,0035°, soit **1 count sur 65535**. C'est ce que le §6bis
+  du handoff cherchait à démontrer, et l'auto-test de la console retrouve les mêmes chiffres.
+- **Sortie Free-D** (`vp_bridge.py --source simulate`) : 267 paquets de 29 octets à 60 Hz,
+  **aucun rejeté** par `freed.decode_d1()`. L'étape 2 du §9 passe avant même qu'Unreal soit
+  dans la boucle.
+
+⚠️ Aucun de ces chiffres ne vient du matériel. Ils mesurent la cohérence du code avec les
+constantes que la démo injecte elle-même — le §11 du handoff met en garde contre exactement
+cette lecture. Ce qu'ils ne peuvent pas dire est au §10.
+
+⚠️ En particulier, l'auto-test de `survive_clock.py` valide sa logique de repli sur données
+fabriquées, **pas** la présence réelle d'un horodatage dans ta version de pysurvive. Seule
+la sonde répond, trackers branchés — et c'est la première commande à lancer après la
+première mise sous tension :
+
+```bash
+python3 bridge/survive_clock.py --probe
+```
 
 ## Arborescence
 
@@ -45,12 +63,11 @@ bridge/      la chaîne temps réel
   requirements.txt   numpy >= 1.24 (plus pysurvive, hors PyPI)
 tools/       calibration et diagnostic
   vp-console.py      serveur web, 3 onglets — Studio, Objectifs, Test
-  gui-decouple.py    interface de découplage
   calib-world.py     équivalent CLI de l'onglet Studio
   calib-axis.py      équivalent CLI de l'onglet Objectifs
   test-decouple.py   équivalent CLI de l'onglet Test
 system/      vp-bridge.service
-docs/        HANDOFF-free-D-v4.md — la source de vérité
+docs/        HANDOFF-free-D-v5.md — la source de vérité
 archive-v2/  architecture abandonnée, conservée pour mémoire
 ```
 
@@ -61,13 +78,17 @@ pip install -r bridge/requirements.txt      # numpy
 # puis construire libsurvive et ses bindings Python (pysurvive), hors PyPI
 ```
 
+Sur une Ubuntu Studio nue, `pip` et `venv` peuvent manquer :
+`sudo apt install python3-venv python3-numpy` avant tout le reste.
+
 Les trackers doivent être en **USB filaire direct** — libsurvive ne sait pas appairer.
 
 ## Démarrage
 
 ```bash
+tools/vp-console.py --selftest      # ~30 s, sans rien brancher
 systemctl --user stop vp-bridge     # libsurvive est exclusif : un seul processus
-tools/vp-console.py --demo          # sans matériel
+tools/vp-console.py --demo          # l'interface, sans matériel
 tools/vp-console.py                 # puis http://127.0.0.1:8410
 ```
 
@@ -77,7 +98,7 @@ problèmes Unreal des problèmes de tracking.
 ## archive-v2/ — ce qui a été abandonné
 
 La version 2 lisait le zoom et le focus par des **encodeurs magnétiques AS5600** sur un
-RP2040 en CircuitPython, reliés en série. Le §1 du handoff v4 retire cette voie au profit
+RP2040 en CircuitPython, reliés en série. Le §1 du handoff v5 retire cette voie au profit
 de trois trackers Vive : une seule horloge, un seul bus, une seule chaîne de latence.
 
 Disparaissent avec elle le firmware CircuitPython, le protocole série `E:F:...`, la règle

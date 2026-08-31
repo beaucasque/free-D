@@ -1,10 +1,11 @@
-# HANDOFF free-D v4 — tracking caméra virtuelle tout-Vive
+# HANDOFF free-D v5 — tracking caméra virtuelle tout-Vive
 
 **État :** code écrit et auto-testé hors matériel. Rien n'a encore tourné sur
 les trackers réels. Toute la validation reste à faire.
 
-**Remplace** v2 et v3. Les §4, §8, §9 et §11.3 de v2 sont caducs. Par
-rapport à v3, la question ouverte de l'horodatage est traitée : voir §6bis.
+**Remplace** v2, v3 et v4. Les §4, §8, §9 et §11.3 de v2 sont caducs.
+v4 affirmait au §5 que tous les outils avaient un `--selftest` : c'était faux
+pour trois d'entre eux. Corrigé ici, et les auto-tests manquants sont écrits.
 
 ---
 
@@ -125,9 +126,32 @@ free-D/
     └── vp-bridge.service   plus de --port série
 ```
 
-Chaque module a un auto-test : `python3 bridge/lensaxis.py`,
-`python3 bridge/worldframe.py`, `tools/*.py --selftest`. Tous doivent finir
-par une ligne `OK — ...`. **Les lancer avant de toucher au matériel.**
+`gui-decouple.py` est **supprimé** : `vp-console.py` le remplace intégralement.
+Maintenir deux interfaces web pour la même mesure n'avait pas de sens.
+
+### Auto-tests — la liste exacte
+
+Tous finissent par une ligne `OK — ...` et sortent en code 0.
+**Les lancer avant de toucher au matériel.**
+
+| Commande | Ce qu'il valide | Durée |
+|---|---|---|
+| `python3 bridge/freed.py` | encodage D1, checksum | <1 s |
+| `python3 bridge/lensaxis.py` | SVD d'axe, multi-tour, slerp, garde-montage | <1 s |
+| `python3 bridge/worldframe.py` | plan de sol, repère, lecture LH | <1 s |
+| `python3 bridge/survive_clock.py` | détection d'unité, replis | <1 s |
+| `tools/calib-axis.py --selftest` | verdicts de montage, absolu/multi-tour, alerte caméra | <1 s |
+| `tools/calib-world.py --selftest` | chaîne sol/écran/médiane | <1 s |
+| `tools/test-decouple.py --selftest` | analyse par phase, référence au repos | <1 s |
+| `tools/vp-console.py --selftest` | **machine à états du Hub**, les trois onglets enchaînés, gardes | ~30 s |
+
+Le dernier est le seul qui exerce l'enchaînement complet : trois relevés →
+résolution → balayage d'axe → phases de test, avec les refus attendus (trois
+points confondus, caméra utilisée comme axe d'objectif). Les autres ne
+valident que la math de leur module.
+
+**Aucun de ces tests ne touche au matériel.** Ce qu'ils ne peuvent pas dire
+est au §10.
 
 ---
 
@@ -297,9 +321,10 @@ scalaire, `--floor-offset-mm`, à mesurer une fois au réglet.
 | # | Commande | Valide |
 |---|---|---|
 | 0 | `python3 bridge/freed.py`, `lensaxis.py`, `worldframe.py`, `survive_clock.py` | intégrité du clone |
-| 1 | `tools/vp-console.py --demo` | les trois onglets, sans matériel |
+| 1 | `tools/vp-console.py --selftest` puis `--demo` | machine à états, puis l'interface |
 | 2 | `bridge/vp_bridge.py --source simulate --verbose` | plugin LiveLinkFreeD, sens des axes |
-| 3 | console → liste d'appareils | énumération, identifiants stables, **état de l'horloge** |
+| 3 | `python3 bridge/survive_clock.py --probe` | **présence et unité de l'horodatage** |
+| 3b | console → liste d'appareils | énumération, identifiants stables |
 | 4 | onglet Studio | `world.json`, échelle au ruban, diagnostic LH |
 | 5 | onglet Objectifs | `axes.json`, verdict de montage, course |
 | 6 | onglet Test, phase roulis | découplage caméra/objectif |
@@ -313,11 +338,27 @@ tracking.
 
 ## 10. Questions ouvertes
 
-**Quelle unité d'horodatage expose ta version de pysurvive ?** Le module la
-détecte seul, mais la première mise sous tension doit confirmer que l'état
-affiché n'est pas `monotonic — aucun horodatage exposé`. Si c'est le cas, le
-champ n'existe pas dans ce binding et il faudra le chercher ailleurs
-(`survive_simple_object_get_latest_pose` via ctypes).
+**Ta version de pysurvive expose-t-elle un horodatage ?** L'auto-test de
+`survive_clock.py` ne valide que sa logique sur données fabriquées : il ne
+peut pas répondre à ça. Une sonde le fait, trackers branchés :
+
+```bash
+python3 bridge/survive_clock.py --probe
+```
+
+Elle affiche ce que `Pose()` renvoie réellement (type, longueur, contenu de
+chaque élément), la liste des méthodes de l'objet, puis tente de résoudre
+l'horloge sur douze secondes. Trois verdicts possibles :
+
+- *horloge exploitable — <unité>* : rien à faire, bridge et console
+  l'utilisent déjà.
+- *champ présent mais inexploitable* : repli assumé sur l'instant de drain,
+  affiché en jaune dans la console et `HORLOGE:DRAIN` dans le bridge.
+- *aucun horodatage exploitable* : chercher dans la liste des méthodes
+  affichée, ou appeler `survive_simple_object_get_latest_pose` en ctypes.
+
+**C'est la première commande à lancer après la première mise sous tension**,
+avant même la calibration : tout le reste en dépend.
 
 **Sémantique de l'horodatage.** Résolution ou balayage ? Voir §6bis : le test
 des deux trackers solidaires tranche.
@@ -351,5 +392,7 @@ supprimerait le problème.
 - Bouger une base station après calibration.
 - Réintroduire une lecture unique de `NextUpdated()` par tick.
 - Horodater au `time.monotonic()` du drain quand une horloge est disponible.
-- Prendre pour argent comptant un chiffre issu de `--demo` : il ne mesure que
-  la cohérence du code avec les constantes que la démo injecte elle-même.
+- Prendre pour argent comptant un chiffre issu de `--demo` ou d'un
+  `--selftest` : ils ne mesurent que la cohérence du code avec les constantes
+  que la démo injecte elle-même. Aucun ne dit quoi que ce soit du matériel.
+- Écrire dans ce document qu'un outil a un `--selftest` sans l'avoir lancé.

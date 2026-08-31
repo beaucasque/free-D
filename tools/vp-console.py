@@ -41,7 +41,9 @@ import argparse
 import json
 import math
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1125,6 +1127,136 @@ class Handler(BaseHTTPRequestHandler):
             h.phase_stop()
 
 
+def selftest():
+    """Isole l'auto-test du disque, puis lance l'enchainement.
+
+    L'onglet Objectifs se termine par un `sweep_save`, et l'auto-test doit
+    l'exercer : c'est la derniere transition de la machine a etats. Mais il
+    ecrit dans AXES_PATH, donc dans bridge/ — une calibration DEMO-CAM
+    fabriquee, deposee juste avant la vraie calibration puisque le §9
+    demande de lancer les auto-tests avant de toucher au materiel. Le bridge
+    et la console la reliraient au demarrage.
+
+    Les deux chemins pointent donc vers un repertoire temporaire, detruit a
+    la sortie. Le Hub est construit APRES la bascule : sinon il precharge
+    l'axes.json reel et l'auto-test ne dirait plus la meme chose selon
+    l'etat de calibration de la machine.
+    """
+    global AXES_PATH, WORLD_PATH
+    saved = (AXES_PATH, WORLD_PATH)
+    tmp = tempfile.mkdtemp(prefix="vp-console-selftest-")
+    AXES_PATH = os.path.join(tmp, "axes.json")
+    WORLD_PATH = os.path.join(tmp, "world.json")
+    try:
+        return _selftest_run()
+    finally:
+        AXES_PATH, WORLD_PATH = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _selftest_run():
+    """Fait tourner les trois onglets de bout en bout, sans HTTP ni materiel.
+
+    C'est le seul test qui exerce la MACHINE A ETATS du Hub : enchainement
+    des trois releves, resolution du repere, balayage d'axe, phases du test.
+    Les auto-tests des modules ne valident que leur math ; ici on verifie que
+    la console les enchaine correctement.
+
+    Dure une trentaine de secondes : la demo tourne en temps reel.
+    """
+    hub = Hub(demo=True)
+    demo_poses(0.0, "libre")
+    r, o = _DEMO_R
+    hub.lighthouses = {"LH0": list(o + r @ np.array([2.1, -2.6, 2.45])),
+                       "LH1": list(o + r @ np.array([2.1, 2.6, 2.45]))}
+    threading.Thread(target=hub.loop, daemon=True).start()
+    time.sleep(3.0)
+
+    def wait(pred, limit=20.0):
+        end = time.time() + limit
+        while time.time() < end:
+            if pred():
+                return True
+            time.sleep(0.1)
+        return False
+
+    print("horloge   : %s" % hub.clock.describe())
+    assert hub.clock.scale is not None, "l'horloge aurait du se resoudre"
+
+    # -- studio ---------------------------------------------------------
+    for slot, dev in (("left", "DEMO-CTRL1"), ("right", "DEMO-CTRL2"),
+                      ("camera", "DEMO-CTRL3")):
+        hub.studio_capture(slot, [dev], seconds=1.5)
+        assert wait(lambda: hub.capture is None), "releve %s bloque" % slot
+    hub.studio_solve(floor_offset_mm=31.0, screen_mm=4000.0)
+    w = hub.world
+    assert w, hub.msg
+    print("studio    : ecran %.0f mm | camera %.0f mm | deport %+.0f mm | "
+          "incertitude %.3f deg"
+          % (w["screen_width_mm"], w["camera_distance_mm"],
+             w["camera_lateral_mm"], hub.world_report["unc"]))
+    assert abs(w["screen_width_mm"] - 4000.0) < 20.0
+    assert abs(w["camera_lateral_mm"] - 60.0) < 20.0
+    assert hub.world_report["lh"]["opposed"]
+
+    # Deux points au lieu de trois : doit etre refuse.
+    saved = hub.slots["camera"]
+    hub.slots["camera"] = hub.slots["left"]
+    hub.world = None
+    hub.studio_solve()
+    assert hub.world is None, "deux points colineaires auraient du etre refuses"
+    print("garde     : trois points confondus -> refuse")
+    hub.slots["camera"] = saved
+
+    # -- objectifs -------------------------------------------------------
+    hub.set_camera("DEMO-CAM")
+    time.sleep(0.5)
+    for name, dev in (("focus", "DEMO-FOC"), ("zoom", "DEMO-ZOO")):
+        hub.sweep_start(name, dev)
+        time.sleep(6.0)
+        hub.sweep_stop()
+        rr = hub.sweep_result
+        assert rr, hub.msg
+        print("objectif  : %-6s %-9s course %.0f deg | planeite %.4f"
+              % (name, rr["verdict"], rr["cal"]["span_deg"],
+                 rr["cal"]["planarity"]))
+        hub.sweep_save()
+    assert set(hub.axes) == {"focus", "zoom"}
+
+    hub.sweep_start("focus", "DEMO-CAM")
+    assert hub.sweep is None, "la camera ne peut pas servir d'axe d'objectif"
+    print("garde     : camera comme axe d'objectif -> refuse")
+
+    # -- test -------------------------------------------------------------
+    hub.test_arm()
+    assert hub.tap
+    hub.phase_start("repos")
+    time.sleep(3.0)
+    hub.phase_stop()
+    assert hub.ref, "la phase repos aurait du etablir la reference"
+
+    out = {}
+    for ph in ("panoramique", "roulis"):
+        hub.phase_start(ph)
+        time.sleep(6.0)
+        snap = hub.snapshot()
+        out[ph] = snap["test"]["axes"]
+        hub.phase_stop()
+        for a, v in out[ph].items():
+            print("test %-11s %-6s crete naif %6.3f deg | aligne %6.3f deg | "
+                  "%4d counts" % (ph, a, v["peak_n"], v["peak_a"], v["counts"]))
+
+    # Le roulis est colineaire a l'axe des pignons : c'est la phase qui doit
+    # reveler la fuite, et l'alignement doit l'annuler.
+    roll = out["roulis"]["focus"]
+    assert roll["peak_n"] > 0.2, "le roulis aurait du faire fuir la chaine naive"
+    assert roll["peak_a"] < roll["peak_n"] / 10.0, roll
+    hub.stop.set()
+
+    print("\nOK — studio, objectifs et test enchaines ; gardes actives.")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -1132,7 +1264,12 @@ def main():
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8410)
     p.add_argument("--demo", action="store_true")
+    p.add_argument("--selftest", action="store_true",
+                   help="enchainer les trois onglets sans HTTP (~30 s)")
     args = p.parse_args()
+
+    if args.selftest:
+        return selftest()
 
     hub = Hub(demo=args.demo)
     if args.demo and not hub.lighthouses:

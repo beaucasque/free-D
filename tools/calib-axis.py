@@ -281,6 +281,83 @@ def cmd_calibrate(args):
     print("\nEnregistre dans %s" % args.config)
 
 
+def selftest():
+    """Valide la logique de decision de cet outil, sans materiel.
+
+    lensaxis.py teste deja la math d'ajustement. Ce qui appartient en propre
+    a calib-axis.py, c'est ce qu'il DECIDE : accepter ou refuser un montage,
+    detecter une camera qui a bouge, annoncer un axe absolu ou multi-tour.
+    Ce sont ces verdicts qui sont verifies ici.
+    """
+    import numpy as np
+    rng = np.random.default_rng(5)
+
+    def q_from(axis, ang):
+        a = np.asarray(axis, float)
+        a /= np.linalg.norm(a)
+        s = math.sin(ang / 2.0)
+        return lensaxis.q_norm((math.cos(ang / 2.0),
+                                a[0] * s, a[1] * s, a[2] * s))
+
+    def sweep(span_deg, swing_deg, cam_deg=0.0, n=400):
+        """Fabrique un balayage : bague sur son axe, swing parasite, et une
+        camera qui derive eventuellement pendant la mesure."""
+        ax = np.array([0.31, -0.84, 0.44])
+        ax /= np.linalg.norm(ax)
+        mount = q_from([1.0, 0.2, -0.4], 0.7)
+        out, cams = [], []
+        for i in range(n):
+            u = i / (n - 1)
+            q_cam = q_from([0, 0, 1], math.radians(cam_deg) * u)
+            cams.append(q_cam)
+            swing = q_from(rng.normal(size=3),
+                           math.radians(swing_deg) * rng.normal())
+            q_lens = lensaxis.q_mul(q_cam, lensaxis.q_mul(
+                mount, lensaxis.q_mul(q_from(ax, math.radians(span_deg) * u),
+                                      swing)))
+            # Le releve se fait toujours en relatif camera.
+            out.append(lensaxis.relative(q_cam, q_lens))
+        return out, cams
+
+    def cam_motion(cams):
+        q0 = cams[0]
+        return max(math.degrees(math.sqrt(sum(
+            c * c for c in lensaxis.q_log(
+                lensaxis.q_mul(lensaxis.q_conj(q0), q)))))
+            for q in cams[::max(1, len(cams) // 300)])
+
+    print("%-26s %-9s %8s %9s %s"
+          % ("CAS", "VERDICT", "COURSE", "PLANEITE", "DECISION"))
+    print("-" * 74)
+    results = {}
+    for label, span, swing, cam in (
+            ("montage rigide, 270 deg", 270.0, 0.2, 0.0),
+            ("montage qui flotte", 270.0, 9.0, 0.0),
+            ("multi-tour, 520 deg", 520.0, 0.2, 0.0),
+            ("camera qui a bouge", 270.0, 0.2, 6.0)):
+        samples, cams = sweep(span, swing, cam)
+        cal = lensaxis.fit_axis(samples)
+        v, _why = lensaxis.verdict(cal)
+        move = cam_motion(cams)
+        decision = ("ABSOLU" if cal["span_deg"] < 355.0 else "MULTI-TOUR")
+        if v == "REFAIRE":
+            decision = "REFUSE (sans --force)"
+        if move > 2.0:
+            decision += " + ALERTE CAMERA %.1f deg" % move
+        print("%-26s %-9s %7.0f deg %9.4f %s"
+              % (label, v, cal["span_deg"], cal["planarity"], decision))
+        results[label] = (v, cal, move, decision)
+
+    assert results["montage rigide, 270 deg"][0] == "OK"
+    assert results["montage qui flotte"][0] == "REFAIRE"
+    assert results["multi-tour, 520 deg"][1]["span_deg"] > 355.0
+    assert results["camera qui a bouge"][2] > 2.0
+    assert abs(results["montage rigide, 270 deg"][1]["span_deg"] - 270.0) < 3.0
+
+    print("\nOK — verdicts de montage, absolu/multi-tour et alerte camera.")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__,
@@ -302,8 +379,12 @@ def main():
                    help="inverser le sens de la valeur Free-D")
     p.add_argument("--force", action="store_true",
                    help="enregistrer meme si le verdict est REFAIRE")
+    p.add_argument("--selftest", action="store_true",
+                   help="valider la logique de decision, sans materiel")
     args = p.parse_args()
 
+    if args.selftest:
+        return selftest()
     if args.list:
         return cmd_list(args)
     if args.set_camera:

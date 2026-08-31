@@ -1,0 +1,8 @@
+# Calibrations : propres a une installation, produites par la console.
+# Le §4 du handoff les decrit comme le resultat d'un releve physique — les
+# versionner ferait suivre a un clone la geometrie d'un autre plateau.
+bridge/axes.json
+bridge/world.json
+
+__pycache__/
+*.pyc

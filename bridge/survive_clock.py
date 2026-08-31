@@ -57,6 +57,7 @@ Ce module retire le retard de FILE. Il ne certifie pas la semantique.
 """
 
 import math
+import sys
 import time
 
 import numpy as np
@@ -245,9 +246,81 @@ class SurviveClock:
                 % (self.unit, self.latency_ms[1]))
 
 
+# --------------------------------------------------------------------- sonde
+
+
+def probe(seconds=12.0):
+    """Interroge le VRAI binding pysurvive. Repond a la question ouverte.
+
+    L'auto-test ci-dessous ne valide que la logique sur donnees fabriquees :
+    il ne peut pas savoir si ta version de pysurvive expose un horodatage.
+    Cette sonde, si. Elle a besoin des trackers branches.
+    """
+    try:
+        import pysurvive
+    except ImportError:
+        print("pysurvive absent — impossible de sonder.")
+        return 2
+    ctx = pysurvive.SimpleContext(sys.argv[:1])
+
+    print("Sonde de %.0f s. Bouge un tracker.\n" % seconds)
+    shape = None
+    attrs = None
+    clk = SurviveClock()
+    t_end = time.monotonic() + seconds
+    seen = 0
+
+    while time.monotonic() < t_end:
+        u = ctx.NextUpdated()
+        if u is None:
+            time.sleep(0.004)
+            continue
+        seen += 1
+        if shape is None:
+            try:
+                p = u.Pose()
+            except Exception as e:
+                p = "erreur : %s" % e
+            print("Pose() -> %s" % type(p).__name__)
+            if isinstance(p, (tuple, list)):
+                print("  longueur %d" % len(p))
+                for i, v in enumerate(p):
+                    print("    [%d] %-14s %r"
+                          % (i, type(v).__name__,
+                             v if not hasattr(v, "Pos") else "SurvivePose"))
+            shape = True
+            attrs = sorted(a for a in dir(u)
+                           if not a.startswith("_") and callable(getattr(u, a, None)))
+            print("\nMethodes de l'objet :\n  %s\n" % ", ".join(attrs))
+        clk.feed(read_timecode(u), time.monotonic())
+
+    print("%d poses recues." % seen)
+    if not clk.raw:
+        print("\nVERDICT : AUCUN horodatage exploitable.")
+        print("read_timecode() n'a rien trouve. Chercher du cote de")
+        print("survive_simple_object_get_latest_pose() en ctypes, ou d'une")
+        print("methode de la liste ci-dessus. Sans ca, le bridge reste sur")
+        print("l'instant de drain et le residu de decouplage ne descendra")
+        print("pas sous quelques millisecondes.")
+        return 1
+
+    lo, hi = min(clk.raw), max(clk.raw)
+    print("\nChamp candidat : %d valeurs, de %.6g a %.6g" % (len(clk.raw), lo, hi))
+    if clk.solve():
+        print("VERDICT : horloge exploitable — %s" % clk.unit)
+        print("  echelle %.6e s par unite" % clk.scale)
+        print("  retard de file %.1f ms (p95)" % clk.latency_ms[1])
+        print("\nRien a changer : le bridge et la console l'utilisent deja.")
+        return 0
+    print("VERDICT : champ present mais inexploitable — %s" % clk.unit)
+    print("Le bridge retombera sur l'instant de drain, en l'affichant.")
+    return 1
+
+
 # ------------------------------------------------------------------ auto-test
 
-if __name__ == "__main__":
+
+def selftest():
     rng = np.random.default_rng(7)
 
     def simulate(scale, name, n=900, base=0.004, jit=0.012, skew_ms=3.0):
@@ -316,3 +389,12 @@ if __name__ == "__main__":
     assert clk.state == "monotonic"
 
     print("\nOK — unite detectee, offset cale sur le plancher, replis surs.")
+    print("NOTE : ceci ne valide que la logique. Pour savoir si TA version de")
+    print("pysurvive expose un horodatage : python3 survive_clock.py --probe")
+    return 0
+
+
+if __name__ == "__main__":
+    if "--probe" in sys.argv:
+        sys.exit(probe())
+    sys.exit(selftest())
