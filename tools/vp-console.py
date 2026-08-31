@@ -57,6 +57,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BRIDGE = os.path.join(HERE, "..", "bridge")
 sys.path.insert(0, BRIDGE)
 
+import freed           # noqa: E402
 import lensaxis        # noqa: E402
 import survive_clock   # noqa: E402
 import worldframe      # noqa: E402
@@ -163,6 +164,21 @@ class Hub:
         self.phase_t0 = None
         self._wf = None          # repere plateau precalcule pour la vue de
         self._wf_key = None      # dessus ; recalcule quand world change
+
+        # -- onglet Sortie : la trame Free-D telle qu'Unreal la recevrait.
+        # Meme math que vp_bridge.py, pas une approximation : pose camera
+        # passee dans world.json, angles d'objectif en relatif camera,
+        # conversion en counts par lensaxis.to_freed.
+        self.outs = {}           # par axe : cal, inv_ref, accumulateur
+        self.outp = []           # echantillons objectif en attente de slerp
+        self.freed = None        # derniere trame decodee
+        self.sender = None       # FreeDSender si l'emission est active
+        self.emit_to = None      # (host, port)
+        self.emit_n = 0          # paquets emis
+        self.emit_hz = 0.0
+        self._emit_t = 0.0
+        self._emit_c = 0
+        self.results = {}        # onglet Test : verdicts figes par phase
         self.done = []
         self.ref = None
         self.msg = ""
@@ -233,7 +249,28 @@ class Hub:
             if self.tap and dev in self.tap["devices"]:
                 self.tap["pending"].append((t, dev, quat, pos))
 
+            # La sortie Free-D doit vivre des que les axes sont calibres,
+            # sans qu'on ait a armer un test.
+            if any(c.get("device") == dev for c in self.axes.values()):
+                self.outp.append((t, dev, quat))
+
+    def _prepare_frame(self):
+        """Repere plateau precalcule, refait quand world change d'identite.
+
+        Appele depuis _resolve et non depuis snapshot : snapshot ne tourne
+        que si un navigateur est connecte, alors que la sortie Free-D doit
+        etre exprimee dans le repere plateau qu'il y ait un client ou non.
+        """
+        if self.world is None or self._wf_key is self.world:
+            return
+        try:
+            self._wf = worldframe.prepare(dict(self.world))
+        except Exception:                                # noqa: BLE001
+            self._wf = None
+        self._wf_key = self.world
+
     def _resolve(self, now):
+        self._prepare_frame()
         if self.capture and now > self.capture[2]:
             self.capture = None
 
@@ -251,6 +288,22 @@ class Hub:
                 self.sweep["cam"].append(got[0])
             self.sweep["pending"] = keep
 
+        # Sortie Free-D : meme regle que partout, on n'extrapole jamais la
+        # pose camera. Un echantillon plus recent que l'historique attend le
+        # tick suivant, et est abandonne au-dela de 200 ms.
+        keep_o = []
+        for t, dev, quat in self.outp:
+            got = self.hist.at(t)
+            if got is None or got[2] == "extrap":
+                if now - t < 0.2:
+                    keep_o.append((t, dev, quat))
+                continue
+            if got[2] == "stale":
+                continue
+            self._out_update(t, dev, quat, got)
+        self.outp = keep_o[-600:]
+        self._out_frame(now)
+
         if self.tap:
             keep = []
             for t, dev, quat, pos in self.tap["pending"]:
@@ -267,6 +320,158 @@ class Hub:
                 self.tap["exact"] += 1
                 self._tap_update(t, dev, quat, pos, got)
             self.tap["pending"] = keep
+
+    # -- sortie Free-D ----------------------------------------------------
+
+    def _out_state(self, name):
+        """Accumulateur par axe, cree a la volee et refait si la calibration
+        change (nouveau balayage enregistre)."""
+        cal = self.axes.get(name)
+        if not cal:
+            self.outs.pop(name, None)
+            return None
+        st = self.outs.get(name)
+        if st is None or st["cal"] is not cal:
+            st = self.outs[name] = {
+                "cal": cal,
+                "inv_ref": lensaxis.q_conj(tuple(cal["ref"])),
+                "acc": lensaxis.Accumulator()}
+        return st
+
+    def _out_update(self, t, dev, quat, got):
+        """Angle deroule d'un axe, aligne sur l'horodatage de l'echantillon.
+
+        C'est la chaine 'alignee' de l'onglet Test, mais permanente : elle
+        n'attend pas qu'on arme un test, puisque la sortie Free-D doit
+        exister des que les axes sont calibres.
+        """
+        name = next((n for n, c in self.axes.items()
+                     if c.get("device") == dev), None)
+        if name is None:
+            return
+        st = self._out_state(name)
+        if st is None:
+            return
+        q_cam = got[0]
+        st["theta"] = st["acc"].push(lensaxis.twist_angle(
+            lensaxis.q_mul(st["inv_ref"], lensaxis.relative(q_cam, quat)),
+            st["cal"]["axis"]))
+
+    def _out_frame(self, now):
+        """Assemble la trame, l'encode, la decode, et l'emet si demande.
+
+        On decode ce qu'on vient d'encoder plutot que d'afficher les valeurs
+        d'entree : ce qui s'affiche est donc ce qui part reellement sur le
+        cable, quantification comprise. Une valeur qui saturerait ou se
+        tronquerait se verrait ici, pas dans Unreal.
+        """
+        d = self.dev.get(self.camera)
+        if not d or d.get("quat") is None:
+            self.freed = None
+            return
+        pose = (worldframe.apply(self._wf, d["pos"], d["quat"])
+                if self._wf is not None else tuple(d["pos"]) + tuple(d["quat"]))
+
+        vals = {}
+        for name in ("zoom", "focus"):
+            st = self.outs.get(name)
+            cal = self.axes.get(name)
+            if st is None or cal is None or "theta" not in st:
+                vals[name] = None
+                continue
+            vals[name] = lensaxis.to_freed(st["theta"], cal["lo"], cal["hi"],
+                                           invert=cal.get("invert", False))
+
+        pkt = freed.survive_to_freed(pose,
+                                     zoom=vals["zoom"] or 0,
+                                     focus=vals["focus"] or 0,
+                                     camera_id=1)
+        out = freed.decode_d1(pkt)
+        out["zoom_ok"] = vals["zoom"] is not None
+        out["focus_ok"] = vals["focus"] is not None
+        out["framed"] = self._wf is not None
+        self.freed = out
+
+        if self.sender is not None:
+            try:
+                self.sender.send(pkt)
+                self.emit_n += 1
+                self._emit_c += 1
+            except OSError as e:                          # noqa: BLE001
+                self.msg = "Emission interrompue : %s" % e
+                self.emit_stop()
+        if now - self._emit_t >= 1.0:
+            self.emit_hz = self._emit_c / max(1e-6, now - self._emit_t)
+            self._emit_t, self._emit_c = now, 0
+
+    def report(self):
+        """Rapport texte des phases terminees, exportable et archivable.
+
+        En texte plutot qu'en JSON : il finira colle dans un carnet de bord
+        ou compare a la main d'une session a l'autre, pas relu par un
+        programme.
+        """
+        with self.lock:
+            L = ["Rapport de decouplage camera / objectif — free-D",
+                 time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "",
+                 "horloge      : %s" % self.clock.describe(),
+                 "camera       : %s" % (self.camera or "non declaree"),
+                 "repere       : %s" % ("world.json applique" if self.world
+                                        else "AUCUN — coordonnees brutes"),
+                 ""]
+            for n, c in sorted(self.axes.items()):
+                L.append("axe %-6s : %s, course %.1f deg%s"
+                         % (n, c.get("device"), c.get("span_deg", 0.0),
+                            "  [MULTI-TOUR]" if c.get("span_deg", 0) >= 355.0
+                            else ""))
+            L += ["",
+                  "%-13s %-7s %9s %9s %8s %8s  %s"
+                  % ("PHASE", "AXE", "NAIF", "ALIGNE", "COUNTS", "% COURSE",
+                     "VERDICT"),
+                  "-" * 74]
+            if not self.results:
+                L.append("(aucune phase terminee)")
+            for ph, r in self.results.items():
+                for ax, v in r["axes"].items():
+                    pct = v["pct"]
+                    verdict = ("OK" if pct < 0.3 else
+                               "PASSABLE" if pct < 1.0 else "REFAIRE")
+                    L.append("%-13s %-7s %8.3f° %8.3f° %8d %7.3f%%  %s"
+                             % (ph, ax, v["peak_n"], v["peak_a"], v["counts"],
+                                pct, verdict))
+            L += ["",
+                  "Seuils : moins de 0,3 % de la course = OK, moins de 1 % =",
+                  "passable. La phase 'roulis' est la seule qui juge vraiment :",
+                  "elle est colineaire a l'axe des pignons.",
+                  "",
+                  "Un chiffre issu de --demo ne mesure que la coherence du code",
+                  "avec ses propres constantes (§11 du handoff)."]
+            return "\n".join(L) + "\n"
+
+    def emit_start(self, host, port):
+        if self.sender is not None:
+            self.emit_stop()
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            self.msg = "Port invalide."
+            return
+        self.sender = freed.FreeDSender(host, port)
+        self.emit_to = (host, port)
+        self.emit_n = 0
+        self._emit_t, self._emit_c = time.monotonic(), 0
+        self.msg = "Emission Free-D vers %s:%d." % (host, port)
+
+    def emit_stop(self):
+        if self.sender is not None:
+            try:
+                self.sender.close()
+            except OSError:
+                pass
+        self.sender = None
+        self.emit_to = None
+        self.emit_hz = 0.0
 
     def _tap_update(self, t, dev, quat, pos, got):
         q_cam, p_cam, _ = got
@@ -443,6 +648,7 @@ class Hub:
                        for n, c in self.axes.items()},
                 "rows": [], "pending": [], "exact": 0, "lost": 0}
             self.done = []
+            self.results = {}
             self.ref = None
             self.phase = "libre"
             self.msg = "Test arme. Bloque les bagues au ruban."
@@ -461,6 +667,16 @@ class Hub:
                 return
             if self.phase not in self.done:
                 self.done.append(self.phase)
+            # La crete n'existait que pendant la phase : au phase_stop elle
+            # disparaissait, et rien ne restait a comparer entre phases ni
+            # entre sessions. On la fige ici.
+            snap = self._test_snapshot()
+            self.results[self.phase] = {
+                "t": time.time(),
+                "dur": (time.monotonic() - self.phase_t0)
+                       if self.phase_t0 else 0.0,
+                "axes": {n: dict(v) for n, v in snap["axes"].items()},
+                "exact_pct": snap["exact_pct"]}
             if self.phase == "repos":
                 self.ref = {}
                 for name in self.axes:
@@ -478,15 +694,6 @@ class Hub:
     def snapshot(self):
         with self.lock:
             now = time.monotonic()
-            # Repere plateau precalcule, pour situer les trackers sur la
-            # vue de dessus. Refait seulement quand world change d'identite.
-            if self.world is not None and self._wf_key is not self.world:
-                try:
-                    self._wf = worldframe.prepare(dict(self.world))
-                    self._wf_key = self.world
-                except Exception:                        # noqa: BLE001
-                    self._wf, self._wf_key = None, self.world
-
             devs = []
             for k, d in sorted(self.dev.items()):
                 ts = d.get("ts")
@@ -559,6 +766,12 @@ class Hub:
             out["ref_ok"] = self.ref is not None
             out["cam_rate"] = math.degrees(self.hist.rate())
             out["test"] = self._test_snapshot() if self.tap else None
+            out["results"] = self.results
+            out["freed"] = self.freed
+            out["emit"] = {"on": self.sender is not None,
+                           "to": ("%s:%d" % self.emit_to) if self.emit_to else "",
+                           "n": self.emit_n,
+                           "hz": round(self.emit_hz, 1)}
 
             # Verdict de sante, pour le bandeau permanent. Le pire des
             # trackers commande : c'est lui qui gatera la mesure.
@@ -757,7 +970,11 @@ ol.ph li.on{background:#2d3a42;outline:1px solid var(--aligne)}
 ol.ph li.done::before{content:"✓";color:var(--ok)}
 ol.ph li.key b{color:var(--naif)}
 ol.ph b{font-weight:500;display:block}
-ol.ph small{color:var(--dim);font-size:11.5px;line-height:1.35}
+/* Le li est une grille 20px/1fr : ::before prend (col1,ligne1), le <b>
+   (col2,ligne1), et le <small> retombait en (col1,ligne2) — 20 px de
+   large, soit un mot par ligne. On le force en colonne 2. */
+ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
+ line-height:1.35}
 .hb{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
   padding:7px 16px;border-bottom:1px solid var(--rule);
   background:var(--panel2);font-size:12px;
@@ -779,6 +996,7 @@ ol.ph small{color:var(--dim);font-size:11.5px;line-height:1.35}
   <div class="tab on" data-t="studio">Studio<span class="chk" id="c-studio"></span></div>
   <div class="tab" data-t="axes">Objectifs<span class="chk" id="c-axes"></span></div>
   <div class="tab" data-t="test">Test<span class="chk" id="c-test"></span></div>
+  <div class="tab" data-t="out">Sortie<span class="chk" id="c-out"></span></div>
   <div style="margin-left:auto" class="eyebrow" id="hdr"></div>
 </header>
 
@@ -864,10 +1082,45 @@ ol.ph small{color:var(--dim);font-size:11.5px;line-height:1.35}
       Fais « repos » en premier : c'est elle qui donne la référence.</p>
     </div>
     <div class="card"><h3>Bilan</h3><div id="tstat"></div></div>
+    <div class="card"><h3>Phases terminées</h3>
+      <table><tbody id="tres"></tbody></table>
+      <div style="margin-top:10px">
+        <a id="b-report" href="report" target="_blank"><button>Exporter le rapport</button></a>
+      </div>
+      <p class="note">La crête d'une phase n'existait que pendant qu'elle
+      tournait. Elle est maintenant conservée : les phases se comparent entre
+      elles, et le rapport se garde d'une session à l'autre.</p></div>
   </div>
   <div id="scopes"></div>
 </div></div>
 </main>
+
+<!-- ------------------------------------------------- SORTIE -->
+<div class="pane" id="p-out"><div class="grid">
+  <div>
+    <div class="card"><h3>Émission</h3>
+      <div class="row"><label>Hôte</label>
+        <input id="ehost" value="127.0.0.1"></div>
+      <div class="row"><label>Port</label>
+        <input id="eport" value="40000"></div>
+      <div style="display:flex;gap:8px;margin-top:11px">
+        <button class="go" id="b-emit">Émettre</button>
+        <button class="stop" id="b-emit-stop">Arrêter</button>
+      </div>
+      <div id="estat" class="note" style="margin-top:10px"></div>
+      <p class="note">Unreal écoute par défaut sur le port 40000. La console
+      et le bridge s'excluent — libsurvive n'admet qu'un seul processus —
+      donc c'est ici OU <code>vp_bridge.py</code>, jamais les deux.</p>
+    </div>
+    <div class="card"><h3>Ce qui manque</h3><div id="oreq" class="note"></div></div>
+  </div>
+  <div>
+    <div class="card"><h3>Trame Free-D D1</h3><div id="oframe"></div>
+      <p class="note">Ces valeurs sont décodées depuis les 29 octets
+      réellement encodés, pas depuis les valeurs d'entrée : ce que tu lis est
+      ce qui part sur le câble, quantification comprise.</p></div>
+  </div>
+</div></div>
 
 <div class="bar" id="msg">Prêt.</div>
 
@@ -914,6 +1167,10 @@ function build(){
     go("sweep_start="+$("sel-axis").value+"&device="+encodeURIComponent($("sel-lens").value))};
   $("b-sw-stop").onclick=()=>go("sweep_stop=1");
   $("b-arm").onclick=()=>go("test_arm=1");
+  $("b-emit").onclick=()=>go("emit_start=1&ehost="
+    +encodeURIComponent($("ehost").value)+"&eport="
+    +encodeURIComponent($("eport").value));
+  $("b-emit-stop").onclick=()=>go("emit_stop=1");
   $("b-ph-stop").onclick=()=>go("phase_stop=1");
 }
 
@@ -925,7 +1182,75 @@ ev.onmessage=e=>{const s=JSON.parse(e.data);last=s;
   $("c-test").textContent=s.tab_ready.test?"✓":"";
   $("hdr").textContent=(s.camera?("caméra "+s.camera+" · "):"")+(s.clock||"");
   $("hdr").style.color=s.clock_ok?"var(--dim)":"var(--warn)";
-  health(s);devices(s);studio(s);axes(s);test(s)};
+  $("c-out").textContent=(s.emit&&s.emit.on)?"✓":"";
+  health(s);devices(s);studio(s);axes(s);test(s);outp(s)};
+
+// Verdicts figes au phase_stop. Le seuil est celui de l'onglet : 0,3 % de
+// la course est bon, 1 % passable, au-dela il faut refaire.
+function results(s){
+  const R=s.results||{}, names=Object.keys(R);
+  const tb=$("tres");
+  if(!names.length){
+    tb.innerHTML='<tr><td class="note">Aucune phase terminée.</td></tr>';return}
+  let h='<tr class="eyebrow"><td>phase</td><td>axe</td>'
+       +'<td style="text-align:right">naïf</td>'
+       +'<td style="text-align:right">aligné</td>'
+       +'<td style="text-align:right">counts</td><td></td></tr>';
+  for(const ph of names){
+    const r=R[ph];
+    for(const ax in r.axes){
+      const v=r.axes[ax];
+      const cls=v.pct<0.3?"v-OK":(v.pct<1.0?"v-PASSABLE":"v-REFAIRE");
+      const lab=v.pct<0.3?"OK":(v.pct<1.0?"PASSABLE":"REFAIRE");
+      h+='<tr><td>'+ph+'</td><td class="dim">'+ax+'</td>'
+        +'<td class="mono" style="text-align:right;color:var(--naif)">'
+          +v.peak_n.toFixed(3)+'°</td>'
+        +'<td class="mono" style="text-align:right;color:var(--aligne)">'
+          +v.peak_a.toFixed(3)+'°</td>'
+        +'<td class="mono" style="text-align:right">'+v.counts+'</td>'
+        +'<td class="'+cls+'">'+lab+'</td></tr>';
+    }
+  }
+  tb.innerHTML=h;
+}
+
+// --- onglet Sortie -----------------------------------------------------
+function outp(s){
+  const f=s.freed, box=$("oframe");
+  if(!f){box.innerHTML='<p class="note">Pas de pose caméra. '
+    +'Déclare le tracker caméra dans l\'onglet Objectifs.</p>'}
+  else{
+    const L=(k,v,u)=>'<tr><td>'+k+'</td><td class="mono big" '
+      +'style="text-align:right">'+v+'</td><td class="dim">'+u+'</td></tr>';
+    box.innerHTML='<table><tbody>'
+      +L("pan",  f.pan.toFixed(3),  "°")
+      +L("tilt", f.tilt.toFixed(3), "°")
+      +L("roll", f.roll.toFixed(3), "°")
+      +L("X", f.x.toFixed(1), "mm")
+      +L("Y", f.y.toFixed(1), "mm")
+      +L("Z", f.z.toFixed(1), "mm")
+      +L("zoom",  f.zoom_ok ? f.zoom  : "—", f.zoom_ok ? "/65535" : "non calibré")
+      +L("focus", f.focus_ok? f.focus : "—", f.focus_ok? "/65535" : "non calibré")
+      +'</tbody></table>';
+  }
+  // Ce qui manque pour que la trame ait un sens.
+  const miss=[];
+  if(!s.camera) miss.push("le tracker caméra n'est pas déclaré (onglet Objectifs)");
+  if(!f||!f.framed) miss.push("world.json absent : X/Y/Z sont en coordonnées "
+    +"libsurvive brutes, pas dans le repère plateau (onglet Studio)");
+  if(!s.axes||!s.axes.zoom)  miss.push("axe zoom non calibré : le champ reste à 0");
+  if(!s.axes||!s.axes.focus) miss.push("axe focus non calibré : le champ reste à 0");
+  $("oreq").innerHTML = miss.length
+    ? "<ul style='margin:0;padding-left:18px'><li>"+miss.join("</li><li>")+"</li></ul>"
+    : "<span style='color:var(--ok)'>Rien. La trame est complète.</span>";
+
+  const e=s.emit||{};
+  $("estat").innerHTML = e.on
+    ? '<span style="color:var(--ok)">● émission vers '+e.to+'</span> — '
+      +'<b class="mono">'+e.n+'</b> paquets, <b class="mono">'+e.hz.toFixed(0)
+      +'</b> Hz'
+    : '<span class="dim">● arrêtée</span>';
+}
 
 // Bandeau de sante. Le pire tracker commande : c'est lui qui gatera la
 // mesure, et une moyenne le cacherait. Quand des roles sont attribues, on
@@ -1065,6 +1390,7 @@ function test(s){
     li.classList.toggle("on",li.dataset.name===s.phase);
     li.classList.toggle("done",s.done.includes(li.dataset.name))});
   push(camBuf,s.cam_rate);
+  results(s);
   if(!s.test){return}
   const host=$("scopes");
   for(const axis in s.test.axes){
@@ -1261,6 +1587,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:                      # noqa: BLE001
                 h.msg = "Erreur : %s" % e
             return self._send("{}")
+        if path == "/report":
+            return self._send(h.report(), "text/plain; charset=utf-8")
         if path == "/stream":
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -1302,6 +1630,10 @@ class Handler(BaseHTTPRequestHandler):
             h.phase_start(q["phase"])
         elif "phase_stop" in q:
             h.phase_stop()
+        elif "emit_start" in q:
+            h.emit_start(q.get("ehost") or "127.0.0.1", q.get("eport") or 40000)
+        elif "emit_stop" in q:
+            h.emit_stop()
 
 
 def selftest():
