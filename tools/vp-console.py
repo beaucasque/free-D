@@ -82,36 +82,18 @@ SLOTS = [("left", "Coin bas GAUCHE de l'ecran"),
          ("camera", "Au sol SOUS la camera")]
 
 
-# libsurvive expose aussi les base stations comme des objets suivis, nommes
-# LH0, LH1... Ce ne sont pas des trackers : leur pose ne se rafraichit pas,
-# et les laisser dans la liste affiche un debit nul et un age de plusieurs
-# dizaines de secondes, qui declenchent de fausses alarmes dans le bandeau.
-# On les ecarte ; le nombre de base stations vient deja de la config
-# libsurvive. Motif strict — LH suivi de chiffres — pour ne pas attraper un
-# numero de serie de tracker, qui commence par "LHR-".
-_LIGHTHOUSE = re.compile(r"^LH\d+$")
-
-
-def is_lighthouse(name):
-    return bool(_LIGHTHOUSE.match(str(name)))
-
-
 def dev_names(obj):
-    out = []
-    for attr in ("Serial", "SerialNumber", "Name"):
-        fn = getattr(obj, attr, None)
-        if fn is None:
-            continue
-        try:
-            v = fn()
-        except Exception:
-            continue
-        if isinstance(v, bytes):
-            v = v.decode("utf8", "replace")
-        v = str(v).strip()
-        if v and v not in out:
-            out.append(v)
-    return out
+    """Identifiants d'un objet, le plus stable en tete.
+
+    Delegue a survive_clock : le numero de serie grave (LHR-F3D3F946) plutot
+    que le nom de code (T20), qui n'est qu'un rang d'enumeration et se
+    decale des qu'on branche un appareil de plus.
+    """
+    return survive_clock.object_names(obj)
+
+
+def is_lighthouse(ident):
+    return survive_clock.is_lighthouse(ident)
 
 
 # ------------------------------------------------------------------- moteur

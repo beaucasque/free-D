@@ -57,6 +57,7 @@ Ce module retire le retard de FILE. Il ne certifie pas la semantique.
 """
 
 import math
+import re
 import sys
 import time
 
@@ -246,6 +247,84 @@ class SurviveClock:
                 % (self.unit, self.latency_ms[1]))
 
 
+# ------------------------------------------------------------- identifiants
+
+
+def serial_number(obj):
+    """Numero de serie GRAVE d'un objet libsurvive, ou None.
+
+    Name() renvoie « T20 », « T21 »... c'est-a-dire un RANG D'ENUMERATION,
+    pas une identite. Preuve faite sur le materiel le 31 aout 2026 :
+    brancher un quatrieme appareil a decale tous les noms — le joystick a
+    pris T20 et les trois trackers sont devenus T21, T22, T23. Un axes.json
+    lie a ces noms appliquerait apres coup la calibration du zoom au focus,
+    ou au joystick. C'est exactement le piege du §8.
+
+    survive_simple_serial_number() renvoie « LHR-F3D3F946 », grave dans
+    l'appareil. Le binding Python ne l'expose pas en methode, mais
+    SimpleObject garde le pointeur C dans .ptr et la fonction est dans le
+    module. Prefixes observes : LHR- pour un tracker ou un controleur,
+    LHB- pour une base station.
+    """
+    try:
+        import pysurvive
+    except ImportError:
+        return None
+    fn = (getattr(pysurvive, "simple_serial_number", None)
+          or getattr(pysurvive, "survive_simple_serial_number", None))
+    ptr = getattr(obj, "ptr", None)
+    if fn is None or ptr is None:
+        return None
+    try:
+        v = fn(ptr)
+    except Exception:                                     # noqa: BLE001
+        return None
+    if isinstance(v, bytes):
+        v = v.decode("utf8", "replace")
+    v = str(v or "").strip()
+    return v or None
+
+
+def object_names(obj):
+    """Identifiants d'un objet, du plus stable au moins stable.
+
+    Le premier element est ce qu'il faut ecrire dans axes.json.
+    """
+    out = []
+    s = serial_number(obj)
+    if s:
+        out.append(s)
+    for attr in ("Serial", "SerialNumber", "Name"):
+        fn = getattr(obj, attr, None)
+        if fn is None:
+            continue
+        try:
+            v = fn()
+        except Exception:                                 # noqa: BLE001
+            continue
+        if isinstance(v, bytes):
+            v = v.decode("utf8", "replace")
+        v = str(v).strip()
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+_LH_NAME = re.compile(r"^LH\d+$")
+
+
+def is_lighthouse(ident):
+    """Une base station n'est pas un tracker.
+
+    libsurvive les expose comme des objets suivis, mais leur pose ne se
+    rafraichit pas : les laisser dans la liste fait afficher un debit nul et
+    de fausses alarmes. Deux signatures : la serie commence par LHB- (les
+    trackers sont en LHR-), et le nom de code est LH0, LH1...
+    """
+    t = str(ident)
+    return t.startswith("LHB-") or bool(_LH_NAME.match(t))
+
+
 # --------------------------------------------------------------------- sonde
 
 
@@ -414,6 +493,32 @@ def selftest():
     clk.solve()
     print("champ non-temps: %s" % clk.describe())
     assert clk.state == "monotonic"
+
+    # --- identifiants ------------------------------------------------
+    # Le piege du §8, verifie sur le materiel le 31 aout 2026 : Name()
+    # renvoie un rang d'enumeration, pas une identite.
+    class _Obj:
+        def __init__(self, name, ptr=None):
+            self._n, self.ptr = name, ptr
+
+        def Name(self):
+            return self._n
+
+    # Sans pysurvive utilisable (ou sans .ptr), on retombe sur Name() sans
+    # lever : le repli doit rester sur.
+    o = _Obj("T20")
+    assert object_names(o) == ["T20"], object_names(o)
+    assert serial_number(o) is None
+
+    # Une base station se reconnait par sa serie LHB- comme par son nom.
+    assert is_lighthouse("LHB-CC4C8D34")
+    assert is_lighthouse("LH0")
+    # ... et un tracker ne doit JAMAIS etre pris pour une base station,
+    # meme si sa serie commence elle aussi par LH.
+    assert not is_lighthouse("LHR-F3D3F946")
+    assert not is_lighthouse("T20")
+    print("[ident]    series LHR- / LHB- distinguees ; repli sur Name() si le")
+    print("           binding n'expose pas la serie")
 
     print("\nOK — unite detectee, offset cale sur le plancher, replis surs.")
     print("NOTE : ceci ne valide que la logique. Pour savoir si TA version de")

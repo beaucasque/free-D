@@ -69,25 +69,15 @@ def _stop(signum, frame):
 
 
 def dev_names(obj):
-    """Identifiants d'un objet libsurvive : serie si disponible, nom de code
-    sinon. axes.json accepte n'importe lequel — mais jamais l'ordre
-    d'enumeration : trois trackers identiques sur un hub ne remontent pas
-    dans un ordre garanti au redemarrage."""
-    out = []
-    for attr in ("Serial", "SerialNumber", "Name"):
-        fn = getattr(obj, attr, None)
-        if fn is None:
-            continue
-        try:
-            v = fn()
-        except Exception:
-            continue
-        if isinstance(v, bytes):
-            v = v.decode("utf8", "replace")
-        v = str(v).strip()
-        if v and v not in out:
-            out.append(v)
-    return out
+    """Identifiants d'un objet, le plus stable en tete.
+
+    Delegue a survive_clock.object_names : le numero de serie GRAVE
+    (LHR-F3D3F946) passe avant le nom de code (T20). Ce dernier n'est qu'un
+    rang d'enumeration — verifie le 31 aout 2026 : brancher un quatrieme
+    appareil a decale tous les noms. axes.json doit porter la serie, sans
+    quoi la calibration du zoom finirait appliquee au focus.
+    """
+    return survive_clock.object_names(obj)
 
 
 class SurviveSource:
