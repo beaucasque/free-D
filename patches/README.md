@@ -39,5 +39,40 @@ ferme hors callback. C'est le schéma que libsurvive emploie déjà pour
 `request_close`, consommé au même endroit : le mécanisme existait, ce
 chemin-là ne l'utilisait pas.
 
-**Amont.** Branche `submit/defer-usb-close` dans le clone, prête à pousser
-sur un fork. Non soumise à ce jour.
+**Amont.** Non soumis à ce jour. Voir `PR-libsurvive.md`.
+
+**Attention :** ce correctif seul **ne suffit pas**. Il traite une réentrance
+réelle mais secondaire ; la cause du plantage observé est dans le patch 0002.
+
+## 0002-libsurvive-no-free-inflight-transfer.patch
+
+**Ce qu'il corrige — c'est le correctif qui compte.** Dans
+`handle_transfer()`, sur un statut différent de `COMPLETED` :
+
+```c
+if (iface->error_count++ < 10) {
+    if (libusb_submit_transfer(transfer)) {   // != 0 = échec
+        goto shutdown;
+    }
+}                    // succès : on sort du if
+goto disconnect;     // et on tombe quand même dans shutdown:
+```
+
+Quand la resoumission **réussit**, le transfert repart en vol — puis le code
+tombe dans `shutdown:`, qui appelle `libusb_free_transfer()` dessus. libusb
+détruit son mutex alors qu'il figure encore dans la liste des transferts
+actifs ; au passage suivant de la boucle d'événements, le verrou détruit fait
+échouer `pthread_mutex_lock` et l'assertion tombe.
+
+Il manquait un `return`.
+
+Corrige au passage le double `error_count++` : le budget de reprise valait
+cinq échecs au lieu des dix que le code annonce.
+
+**Vérifié sur matériel** le 1er septembre 2026, contre le déclencheur :
+tracker débranché en marche, `NRestarts` reste à 0, même PID de part et
+d'autre, zéro assertion. Avant, le processus mourait à l'instant du
+débranchement.
+
+**Amont.** Branche `submit/no-free-inflight` dans le clone, qui contient les
+deux correctifs. Non soumise à ce jour.

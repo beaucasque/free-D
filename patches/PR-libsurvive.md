@@ -1,6 +1,6 @@
 # Titre
 
-driver_vive: defer USB close out of the libusb transfer callback
+driver_vive: fix two crashes in the USB transfer callback
 
 # Corps
 
@@ -53,25 +53,20 @@ The transfer being handled is still cleaned up as before by the `shutdown:`
 label at the end of `handle_transfer()`, so per-transfer accounting
 (`active_transfers`, `request_close`) is unchanged.
 
+## This is the first of two commits
+
+Applying this one alone does **not** stop the abort. The re-entrancy it
+removes is real, but the crash observed here comes from the second commit's
+subject: `handle_transfer()` frees a transfer it has just resubmitted, so
+`libusb_free_transfer()` destroys the mutex of a transfer still in the
+flying-transfers list.
+
+Confirmed the hard way: with only this commit applied, unplugging a running
+tracker still aborted the process.
+
 ## Testing
 
-Built and run against three wired trackers plus one wireless-capable device
-on a multi-TT hub: 237–242 Hz per device, zero dropouts, lighthouse geometry
-solved as before. No behaviour change in the nominal path.
-
-**Not yet verified against the trigger itself**: the multi-TT hub removed the
-failing transfers, so the faulty path is no longer exercised on this rig. The
-reasoning is from reading the call chain, and the nominal path is confirmed
-free of regressions.
-
-## Aside, not fixed here
-
-`handle_transfer()` increments `iface->error_count` twice per error:
-
-```c
-iface->error_count++;
-if (iface->error_count++ < 10) {
-```
-
-so the retry loop gives up after 5 failures rather than the 10 it reads as.
-Left alone to keep this change to one concern.
+Both commits, three wired trackers on a multi-TT hub: 238–242 Hz per device,
+zero dropouts, lighthouse geometry solved as before, and unplugging a device
+while running no longer aborts — the process keeps serving and reports the
+device gone. Without them, it dies the instant the device goes away.
