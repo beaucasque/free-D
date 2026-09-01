@@ -39,7 +39,9 @@ ferme hors callback. C'est le schéma que libsurvive emploie déjà pour
 `request_close`, consommé au même endroit : le mécanisme existait, ce
 chemin-là ne l'utilisait pas.
 
-**Amont.** Non soumis à ce jour. Voir `PR-libsurvive.md`.
+**Amont.** Poussé le 1er septembre 2026 sur
+`beaucasque/libsurvive`, branche `submit/no-free-inflight`. Pull request pas
+encore ouverte. Voir `PR-libsurvive.md`.
 
 **Attention :** ce correctif seul **ne suffit pas**. Il traite une réentrance
 réelle mais secondaire ; la cause du plantage observé est dans le patch 0002.
@@ -74,5 +76,8 @@ tracker débranché en marche, `NRestarts` reste à 0, même PID de part et
 d'autre, zéro assertion. Avant, le processus mourait à l'instant du
 débranchement.
 
-**Amont.** Branche `submit/no-free-inflight` dans le clone, qui contient les
-deux correctifs. Non soumise à ce jour.
+**Amont.** Branche `submit/no-free-inflight` sur
+<https://github.com/beaucasque/libsurvive>, qui porte les deux correctifs.
+Ouvrir la PR :
+<https://github.com/beaucasque/libsurvive/pull/new/submit/no-free-inflight>,
+en collant `PR-libsurvive.md`.
