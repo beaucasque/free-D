@@ -106,16 +106,39 @@ rapporté.
 
 ---
 
-## 4. Les deux calibrations
+## 4. Les trois fichiers d'installation
 
-Elles sont **indépendantes** et ne se croisent jamais.
+`roles.json` dit **qui est qui**. Les deux autres sont des calibrations,
+**indépendantes**, qui ne se croisent jamais.
 
-| | `bridge/world.json` | `bridge/axes.json` |
-|---|---|---|
-| Contenu | origine, orientation, sol | par axe : tracker, axe de rotation, course |
-| Produit par | onglet Studio (2 contrôleurs) | onglet Objectifs (trackers) |
-| Appliqué à | tracker **caméra** seul | **zoom** et **focus** seuls |
-| Refaire si | une base station ou l'écran bouge | un tracker est démonté ou glisse |
+| | `bridge/roles.json` | `bridge/world.json` | `bridge/axes.json` |
+|---|---|---|---|
+| Contenu | fonction → n° de série | origine, orientation, sol | par axe : tracker, axe de rotation, course |
+| Produit par | onglet Appareils | onglet Studio | onglet Objectifs |
+| Appliqué à | tout | tracker **caméra** seul | **zoom** et **focus** seuls |
+| Refaire si | un appareil est remplacé | une base station ou l'écran bouge | un tracker est démonté ou glisse |
+
+### `roles.json` — un tracker est une variable
+
+Quatre fonctions, attribuées à la main **avant tout le reste** :
+
+```json
+{ "camera": "LHR-…", "zoom": "LHR-…", "focus": "LHR-…", "survey": "LHR-…" }
+```
+
+`survey` est l'appareil qu'on pose au sol pour les trois points du Studio.
+Le code ne connaît que la fonction : remplacer un tracker se fait en
+réattribuant sa fonction, rien d'autre.
+
+**Réattribuer efface ce qui en dépendait.** Un axe qui change d'appareil
+perd sa calibration — elle a été relevée sur un autre montage. Et changer le
+tracker **caméra** fait tomber les **deux** axes, puisqu'ils sont calibrés en
+relatif caméra (`cal["ref"]` est un `conj(q_caméra) · q_objectif`).
+`world.json` n'est pas touché : il vient des trois points au sol.
+
+**Un appareil ne peut tenir qu'une fonction.** Deux rôles sur le même
+appareil donneraient des mesures d'apparence normale — le zoom suivrait le
+focus, sans le moindre signe. La console refuse.
 
 ### Ce qu'aucun des deux ne contient
 
@@ -141,6 +164,7 @@ free-D/
 │   │                       slerp, accumulateur multi-tour, one-euro
 │   ├── worldframe.py       plan de sol, repère plateau, lecture des LH
 │   ├── vp_bridge.py        v3 : 3 trackers, world.json, axes.json
+│   ├── roles.json          produit par la console — qui est qui
 │   ├── axes.json           produit par la console
 │   ├── world.json          produit par la console
 │   └── requirements.txt    numpy + pysurvive (pyserial retiré)
@@ -241,8 +265,26 @@ dépendance GUI, rien depuis un CDN. Depuis le Mac :
 `ssh -L 8410:localhost:8410 unreal`.
 
 **Un seul processus peut parler aux trackers.** La console et le bridge
-s'excluent. C'est la raison d'être du serveur unique : enchaîner les trois
-étapes sans redémarrer.
+s'excluent. C'est la raison d'être du serveur unique : enchaîner les étapes
+sans redémarrer.
+
+Un **bandeau de santé** permanent, hors des onglets, répond à « le tracking
+va-t-il bien ? » avant que la réponse ne se déduise d'une mesure fausse :
+horloge, appareils vus et en service, débit du plus lent, âge de la pose la
+plus vieille, décrochages, base stations. C'est le **pire** appareil qui
+commande — une moyenne cacherait celui qui gâte la mesure.
+
+Cinq onglets, dans l'ordre où on s'en sert.
+
+### Onglet Appareils
+
+Le premier, et il conditionne tout le reste. La liste montre chaque appareil
+par son **numéro de série gravé** et compte ses mètres parcourus : bouge-en
+un, tu sais lequel c'est.
+
+Les quatre fonctions du §4 s'y attribuent à la main. Rien d'autre ne
+fonctionne tant que ce n'est pas fait — le relevé et le balayage refusent de
+démarrer en le disant.
 
 ### Onglet Studio
 
@@ -287,6 +329,25 @@ référence.
 Crête maintenue avec fenêtre de garde de 0,5 s après le démarrage d'une phase
 — sinon la crête retient le geste de reprise en main de la caméra.
 
+Le verdict de chaque phase est **conservé à son arrêt** : les phases se
+comparent entre elles, et `/report` exporte le tout en texte, à archiver
+d'une session à l'autre.
+
+### Onglet Sortie
+
+La trame Free-D D1 telle qu'Unreal la recevra, et son émission UDP — c'est
+l'étape 7 du §9, qui n'avait aucune interface. Même math que `vp_bridge.py`,
+pas une approximation.
+
+Les valeurs affichées sont **décodées depuis les 29 octets qu'on vient
+d'encoder**, pas les valeurs d'entrée : ce qui s'affiche est ce qui part sur
+le câble, quantification comprise. Un panneau « Ce qui manque » nomme ce qui
+empêche la trame d'avoir un sens — fonction non attribuée, `world.json`
+absent (X/Y/Z alors en coordonnées libsurvive brutes), axe non calibré.
+
+La console et le bridge s'excluent toujours : c'est cet onglet **ou**
+`vp_bridge.py`, jamais les deux.
+
 ---
 
 ## 7. Décisions à ne pas rouvrir sans raison
@@ -323,10 +384,18 @@ pas bloquant. L'appeler une seule fois par tour laissait la file grossir : la
 latence dérivait, invisible avec un tracker, franche avec trois. Bug corrigé
 de la v1, ne pas le réintroduire.
 
-**Ne jamais lier un tracker par sa position dans l'énumération.** Trois
-trackers identiques sur un hub ne remontent pas dans un ordre garanti au
-redémarrage. `axes.json` stocke un identifiant ; le prendre dans la colonne
-de gauche de la liste d'appareils.
+**Ne jamais lier un tracker par sa position dans l'énumération.** Le piège
+est réel, vérifié le 31 août 2026 : `Name()` renvoie `T20`, `T21`… c'est-à-dire
+un rang, et brancher un quatrième appareil a renommé les trois trackers déjà
+présents — le nouveau venu a pris `T20`. Un `axes.json` écrit avant aurait
+appliqué après coup la calibration du zoom au focus, silencieusement.
+
+**Résolu.** `survive_simple_serial_number()` renvoie le numéro **gravé** :
+`LHR-F3D3F946`. Le binding Python ne l'expose pas en méthode, mais
+`SimpleObject` garde le pointeur C dans `.ptr` et la fonction est dans le
+module — c'est ce que fait `survive_clock.object_names()`, sur lequel la
+console et le bridge s'appuient tous les deux. Préfixes : `LHR-` pour un
+tracker ou un contrôleur, `LHB-` pour une base station.
 
 **Ne pas extrapoler la pose caméra.** Un échantillon objectif plus récent que
 tout l'historique caméra est **différé d'un tick** (purge à 200 ms).
@@ -351,7 +420,7 @@ scalaire, `--floor-offset-mm`, à mesurer une fois au réglet.
 | 1 | `tools/vp-console.py --selftest` puis `--demo` | machine à états, puis l'interface |
 | 2 | `bridge/vp_bridge.py --source simulate --verbose` | plugin LiveLinkFreeD, sens des axes |
 | 3 | `python3 bridge/survive_clock.py --probe` | **présence et unité de l'horodatage** |
-| 3b | console → liste d'appareils | énumération, identifiants stables |
+| 3b | console → onglet **Appareils** | énumération, et **attribuer les quatre fonctions** — rien ne marche avant |
 | 4 | onglet Studio | `world.json`, échelle au ruban, diagnostic LH |
 | 5 | onglet Objectifs | `axes.json`, verdict de montage, course |
 | 6 | onglet Test, phase roulis | découplage caméra/objectif |
