@@ -65,6 +65,27 @@ voir** — le §11 met en garde contre exactement cette confiance :
 - Une pose de base station **toute à zéro** avec `PositionSet=0` était prise pour une
   position réelle, plaçant une station à l'origine du plateau.
 
+## 1er septembre 2026
+
+- **Le hub doit être multi-TT**, pas seulement alimenté. Quatre trackers full-speed
+  derrière un hub *single-TT* saturent son transaction translator et faisaient planter
+  libsurvive en 2,7 s, systématiquement ; trois sur le même hub tenaient des heures.
+  `cat /sys/bus/usb/devices/<hub>/bDeviceProtocol` — `02` = multi-TT. Un hub « USB 3.0 »
+  est deux hubs dans un boîtier : c'est la partie 2.0 qui compte. Voir §2 du handoff.
+- **Les appareils s'identifient par leur numéro de série gravé.** `Name()` renvoie `T20`,
+  `T21`… un rang d'énumération qui se décale dès qu'on branche un appareil de plus — vérifié.
+  `survive_simple_serial_number()` donne `LHR-F3D3F946`, stable. C'était une question
+  ouverte du §10, elle est réglée.
+- **Quatre fonctions attribuées à la main** dans l'onglet Appareils, avant tout relevé :
+  caméra, zoom, focus, relevé. `bridge/roles.json` lie la fonction au numéro de série ;
+  remplacer un tracker se fait en réattribuant sa fonction, et la calibration devenue
+  caduque est effacée d'elle-même. Voir §4 du handoff.
+- **Deux plantages de libsurvive corrigés**, dans `patches/`, appliqués par `install.sh` :
+  un transfert resoumis était ensuite libéré sous libusb, et le callback de complétion
+  réentrait dans libusb. Soumis en amont —
+  [collabora/libsurvive#372](https://github.com/collabora/libsurvive/pull/372). Vérifié
+  sur matériel : débrancher un tracker en marche ne tue plus le processus.
+
 Restent ouvertes, et hors de portée sans manipulation physique : la **sémantique** de
 l'horodatage (résolution ou balayage — §6bis), le sens de rotation, la course des bagues,
 et `--floor-offset-mm`.
@@ -86,8 +107,9 @@ tools/       calibration et diagnostic
   calib-world.py     équivalent CLI de l'onglet Studio
   calib-axis.py      équivalent CLI de l'onglet Objectifs
   test-decouple.py   équivalent CLI de l'onglet Test
-system/      vp-bridge.service
-install.sh   mise à niveau d'une station : paquets, venv, libsurvive, udev, service
+system/      vp-bridge.service, vp-console.service — supervisés, exclusifs l'un de l'autre
+patches/     correctifs appliqués à libsurvive avant compilation (voir patches/README.md)
+install.sh   mise à niveau d'une station : paquets, venv, libsurvive, udev, services
 docs/        HANDOFF-free-D-v5.md — la source de vérité
 archive-v2/  architecture abandonnée, conservée pour mémoire
 ```
