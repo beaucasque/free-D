@@ -1,7 +1,7 @@
-From 32b5d7c6a52249fc1660fbb75e85505fcf4577f0 Mon Sep 17 00:00:00 2001
+From c8eb7caebd35de13a2f08116b8db60c0f165fae8 Mon Sep 17 00:00:00 2001
 From: beaucasque <kariboumedia@gmail.com>
 Date: Tue, 1 Sep 2026 01:51:12 -0400
-Subject: [PATCH] driver_vive.libusb.h: handle_transfer: do not free a
+Subject: [PATCH 2/2] driver_vive.libusb.h: handle_transfer: do not free a
  resubmitted transfer
 
 On a non-COMPLETED status, handle_transfer() retries by calling
@@ -36,10 +36,10 @@ budget was five failures rather than the ten the code reads as.
  1 file changed, 8 insertions(+), 1 deletion(-)
 
 diff --git a/src/driver_vive.libusb.h b/src/driver_vive.libusb.h
-index 7e55429..c5f5bee 100644
+index 37b620f..61bd336 100644
 --- a/src/driver_vive.libusb.h
 +++ b/src/driver_vive.libusb.h
-@@ -248,11 +248,18 @@ static void handle_transfer(struct libusb_transfer *transfer) {
+@@ -244,11 +244,18 @@ static void handle_transfer(struct libusb_transfer *transfer) {
  	if (!iface->shutdown && transfer->status != LIBUSB_TRANSFER_COMPLETED) {
  		SV_WARN("%f %s Device disconnect: %d", survive_run_time(ctx), survive_colorize_codename(iface->assoc_obj),
  				transfer->status);
