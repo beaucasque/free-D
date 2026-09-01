@@ -152,19 +152,62 @@ if [ "$DO_LIBSURVIVE" = 1 ]; then
     say "libsurvive et pysurvive"
     info "hors PyPI : compile depuis les sources, comme dit requirements.txt"
 
-    # Rien a recompiler si le venv importe deja pysurvive : la compilation
-    # dure plusieurs minutes et le script se veut relancable.
-    if [ "$DRY" = 0 ] && [ -x "$PY" ] \
-       && "$PY" -c "import pysurvive" >/dev/null 2>&1; then
-        info "pysurvive deja installe dans le venv — compilation sautee"
-        info "forcer : $VENV/bin/pip install --no-deps --force-reinstall $LIBSURVIVE_DIR"
+    # Rien a recompiler si le venv importe deja pysurvive ET qu'il a ete
+    # construit avec exactement les correctifs presents. L'empreinte evite
+    # le piege inverse de la simple presence : un pysurvive installe AVANT
+    # l'ajout d'un correctif serait reste non corrige, en silence.
+    STAMP="$VENV/.freed-libsurvive"
+    want=""
+    if ls "$REPO"/patches/*.patch >/dev/null 2>&1; then
+        want=$(cat "$REPO"/patches/*.patch | sha256sum | cut -d" " -f1)
     else
+        want="sans-correctif"
+    fi
+    have=$(cat "$STAMP" 2>/dev/null || echo "")
+
+    if [ "$DRY" = 0 ] && [ -x "$PY" ] \
+       && "$PY" -c "import pysurvive" >/dev/null 2>&1 \
+       && [ "$have" = "$want" ]; then
+        info "pysurvive deja installe avec les correctifs courants"
+        info "forcer : rm $STAMP puis relancer"
+    else
+        [ -n "$have" ] && [ "$have" != "$want" ] \
+            && info "les correctifs ont change depuis la derniere compilation"
         if [ -d "$LIBSURVIVE_DIR/.git" ]; then
             info "depot deja clone, mise a jour"
-            run git -C "$LIBSURVIVE_DIR" pull --ff-only
+            run git -C "$LIBSURVIVE_DIR" fetch -q origin
         else
             run mkdir -p "$(dirname "$LIBSURVIVE_DIR")"
             run git clone --recursive https://github.com/collabora/libsurvive "$LIBSURVIVE_DIR"
+        fi
+
+        # On repart TOUJOURS d'origin/master puis on rejoue nos correctifs :
+        # deterministe, et relancable sans conflit. Un `git pull` sur une
+        # branche portant nos commits echouerait.
+        if [ -d "$REPO/patches" ] && ls "$REPO"/patches/*.patch >/dev/null 2>&1; then
+            say "Correctifs libsurvive"
+            run git -C "$LIBSURVIVE_DIR" checkout -q -B freed-patched origin/master
+            run git -C "$LIBSURVIVE_DIR" submodule -q update --init --recursive
+            for pf in "$REPO"/patches/*.patch; do
+                if [ "$DRY" = 1 ]; then
+                    info "[dry-run] git am $(basename "$pf")"
+                    continue
+                fi
+                # Identite fournie ici : une station neuve n'a pas
+                # forcement de git config --global, et `git am` refuse de
+                # commiter sans.
+                if git -C "$LIBSURVIVE_DIR" \
+                       -c user.name="free-D install" \
+                       -c user.email="install@free-d.local" \
+                       am -q --keep-cr < "$pf"; then
+                    info "applique  $(basename "$pf")"
+                else
+                    git -C "$LIBSURVIVE_DIR" am --abort >/dev/null 2>&1 || true
+                    die "le correctif $(basename "$pf") ne s'applique plus sur
+   origin/master. libsurvive a bouge : relire le patch, ou le retirer de
+   patches/ si l'amont a corrige le probleme."
+                fi
+            done
         fi
 
         # Dans le venv, pas sur le systeme : c'est ce python-la que le bridge
@@ -180,6 +223,7 @@ if [ "$DO_LIBSURVIVE" = 1 ]; then
         # standard et les bindings ctypes generes. Le §6 du handoff pose
         # d'ailleurs l'absence de dependance GUI comme une regle.
         run "$VENV/bin/pip" install --no-deps "$LIBSURVIVE_DIR"
+        [ "$DRY" = 1 ] || printf '%s\n' "$want" > "$STAMP"
     fi
 
     # La regle udev est posee DANS TOUS LES CAS, meme quand la compilation a
@@ -224,7 +268,8 @@ fi
 
 if [ "$DO_UNIT" = 1 ]; then
     say "Service utilisateur (installe, PAS active)"
-    src="$REPO/system/vp-bridge.service"
+    for unit in vp-bridge vp-console; do
+    src="$REPO/system/$unit.service"
     [ -f "$src" ] || die "$src introuvable"
 
     # Le fichier versionne suppose le depot dans ~/free-D et compte sur le
@@ -233,19 +278,26 @@ if [ "$DO_UNIT" = 1 ]; then
     # pysurvive. On ecrit donc l'interpreteur du venv en clair, et le vrai
     # chemin du depot.
     run mkdir -p "$UNIT_DIR"
+    if [ "$unit" = "vp-bridge" ]; then
+        exec_line="ExecStart=$PY $REPO/bridge/vp_bridge.py --source survive --host 127.0.0.1 --rate 60"
+    else
+        exec_line="ExecStart=$PY $REPO/tools/vp-console.py --host 127.0.0.1 --port 8410"
+    fi
     if [ "$DRY" = 1 ]; then
-        info "[dry-run] generation de $UNIT_DIR/vp-bridge.service"
-        info "[dry-run]   ExecStart=$PY $REPO/bridge/vp_bridge.py --source survive --host 127.0.0.1 --rate 60"
+        info "[dry-run] generation de $UNIT_DIR/$unit.service"
+        info "[dry-run]   $exec_line"
     else
         sed -e "s|%h/free-D|$REPO|g" \
-            -e "s|^ExecStart=.*|ExecStart=$PY $REPO/bridge/vp_bridge.py --source survive --host 127.0.0.1 --rate 60|" \
-            "$src" > "$UNIT_DIR/vp-bridge.service"
-        info "ecrit  $UNIT_DIR/vp-bridge.service"
-        info "interpreteur du venv, chemin du depot resolu"
+            -e "s|^ExecStart=.*|$exec_line|" \
+            "$src" > "$UNIT_DIR/$unit.service"
+        info "ecrit  $UNIT_DIR/$unit.service"
     fi
+    done
     run systemctl --user daemon-reload
-    info "laisse a l'arret : libsurvive est exclusif, et le bridge sort en"
-    info "erreur tant que axes.json n'existe pas."
+    info "interpreteur du venv, chemin du depot resolu"
+    info "les deux sont laisses A L'ARRET et s'excluent (Conflicts=) :"
+    info "libsurvive n'admet qu'un processus, et le bridge sort en erreur"
+    info "tant que axes.json n'existe pas."
 fi
 
 # ------------------------------------------------------------ 6. auto-tests

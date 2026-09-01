@@ -1,0 +1,37 @@
+# Service utilisateur pour la console free-D.
+#
+# Installation : ./install.sh l'ecrit dans ~/.config/systemd/user/ avec
+# l'interpreteur du venv et le vrai chemin du depot. Il n'est PAS active.
+#
+#   systemctl --user start vp-console      # au besoin
+#   systemctl --user enable --now vp-console
+#   journalctl --user -u vp-console -f
+#
+# POURQUOI CE SERVICE EXISTE
+#
+# libsurvive peut faire mourir le processus sur un transfert USB en erreur :
+# l'abort() a lieu dans libusb, en C, et Python ne peut pas l'intercepter.
+# patches/0001-libsurvive-deferred-usb-close.patch corrige la cause connue,
+# mais la supervision reste la seule protection generale. Le bridge a la
+# meme (Restart=on-failure) ; la console ne l'avait pas.
+#
+# EXCLUSION MUTUELLE avec vp-bridge : libsurvive n'admet qu'un processus
+# parlant aux trackers. Conflicts= l'impose plutot que de compter sur la
+# memoire de l'operateur — demarrer l'un arrete l'autre.
+
+[Unit]
+Description=Console free-D (relevé, calibration, test, sortie Free-D)
+Conflicts=vp-bridge.service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/free-D
+ExecStart=%h/free-D/tools/vp-console.py --host 127.0.0.1 --port 8410
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

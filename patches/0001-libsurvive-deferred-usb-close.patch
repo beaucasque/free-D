@@ -1,0 +1,96 @@
+From 8b62adcf4c68685560db1ffa44c435b224909bdf Mon Sep 17 00:00:00 2001
+From: beaucasque <kariboumedia@gmail.com>
+Date: Mon, 31 Aug 2026 21:15:42 -0400
+Subject: [PATCH] driver_vive: defer USB close out of the libusb transfer
+ callback
+
+handle_transfer() is libusb's transfer-completion callback: it runs on the
+event thread while libusb holds the current transfer's locks. On a
+non-COMPLETED status it reached survive_disconnect_device(), which called
+survive_close_usb_device() synchronously. That function calls
+libusb_cancel_transfer() on every interface -- including the one whose
+callback is executing -- and survive_config_cancel() does the same.
+
+Re-entering libusb from inside its own callback makes pthread_mutex_lock
+fail, and usbi_mutex_lock() (os/threads_posix.h) asserts, aborting the
+process.
+
+Reproduced with four full-speed trackers behind a single-TT hub, where TT
+saturation makes a transfer fail at startup: crash within 2.7 s, every time.
+
+survive_disconnect_device() now only marks the interfaces down and raises
+request_disconnect. The poll loop in survive_usb_poll() consumes it and
+calls survive_close_usb_device() off-callback, where no libusb lock is
+held. The transfer being handled is still cleaned up as before by the
+shutdown: label at the end of handle_transfer().
+---
+ src/driver_vive.c        | 10 ++++++++++
+ src/driver_vive.libusb.h | 23 ++++++++++++++++++++++-
+ 2 files changed, 32 insertions(+), 1 deletion(-)
+
+diff --git a/src/driver_vive.c b/src/driver_vive.c
+index 005cfff..5605cd0 100755
+--- a/src/driver_vive.c
++++ b/src/driver_vive.c
+@@ -447,6 +447,9 @@ struct SurviveUSBInfo {
+ 	struct survive_config_packet *cfg_user;
+ 
+ 	bool request_close, request_reopen;
++	/* Pose par le callback de completion libusb ; consomme par la
++	   boucle de poll, hors callback. Voir survive_disconnect_device(). */
++	bool request_disconnect;
+ };
+ 
+ struct SurviveViveData {
+@@ -1031,6 +1034,13 @@ int survive_vive_usb_poll(SurviveContext *ctx, void *v) {
+ 
+ 		survive_config_poll(usbInfo);
+ 
++		/* Fermeture demandee depuis un callback de transfert : on la fait
++		   ICI, sur le fil de poll, ou aucun verrou libusb n'est tenu. */
++		if (usbInfo->request_disconnect) {
++			usbInfo->request_disconnect = false;
++			survive_close_usb_device(usbInfo);
++		}
++
+ 		if (survive_handle_close_request_flag(usbInfo)) {
+ 			i--;
+ 		}
+diff --git a/src/driver_vive.libusb.h b/src/driver_vive.libusb.h
+index 25007de..7e55429 100644
+--- a/src/driver_vive.libusb.h
++++ b/src/driver_vive.libusb.h
+@@ -204,8 +204,29 @@ cleanup_and_rtn:
+ static inline void survive_close_usb_device(struct SurviveUSBInfo *usbInfo);
+ 
+ static void survive_disconnect_device(SurviveUSBInterface *iface) {
++	struct SurviveUSBInfo *usbInfo = iface->usbInfo;
+ 	iface->ctx = 0;
+-	survive_close_usb_device(iface->usbInfo);
++
++	/* Nous sommes DANS handle_transfer(), c'est-a-dire dans le callback de
++	   completion de libusb : le fil d'evenements tient les verrous du
++	   transfert courant. survive_close_usb_device() appelle
++	   libusb_cancel_transfer() sur TOUTES les interfaces, dont celle qui est
++	   en train d'etre traitee, et survive_config_cancel() en fait autant.
++	   Reentrer dans libusb ici fait echouer pthread_mutex_lock, et
++	   usbi_mutex_lock() (os/threads_posix.h) leve son assertion : abort().
++
++	   Reproduit avec quatre trackers full-speed derriere un hub single-TT,
++	   ou la saturation du TT fait echouer un transfert au demarrage.
++
++	   On se contente donc de marquer. La boucle de poll appelle
++	   survive_close_usb_device() hors callback, ou aucun verrou n'est
++	   tenu. Le transfert courant, lui, est nettoye normalement par
++	   l'etiquette shutdown: a la fin de handle_transfer(). */
++	for (size_t j = 0; j < usbInfo->interface_cnt; j++) {
++		usbInfo->interfaces[j].shutdown = 1;
++		usbInfo->interfaces[j].assoc_obj = 0;
++	}
++	usbInfo->request_disconnect = true;
+ }
+ static void handle_transfer(struct libusb_transfer *transfer) {
+ 	uint64_t time = OGGetAbsoluteTimeUS();
+-- 
+2.34.1
+

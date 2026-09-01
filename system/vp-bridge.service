@@ -17,6 +17,9 @@
 
 [Unit]
 Description=Bridge tracking Free-D (3 trackers Vive) vers Unreal
+# libsurvive n'admet qu'un processus parlant aux trackers : demarrer
+# le bridge doit arreter la console, et reciproquement.
+Conflicts=vp-console.service
 After=network.target
 
 [Service]
