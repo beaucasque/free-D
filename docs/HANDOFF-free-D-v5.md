@@ -23,7 +23,7 @@ Disparaissent avec eux : le firmware CircuitPython, le protocole série
 du port CDC unique (§8 de v2) — plus de conflit `mpremote` / bridge.
 
 **Plus de Windows.** Le repère du plateau est relevé au sol avec deux
-contrôleurs. `lighthousedb.json` n'est plus dans la boucle. La machine
+un quatrième tracker. `lighthousedb.json` n'est plus dans la boucle. La machine
 Windows ne sert plus qu'aux mises à jour de firmware des trackers.
 
 ---
@@ -36,7 +36,7 @@ Windows ne sert plus qu'aux mises à jour de firmware des trackers.
 | Moteur | Unreal Engine 5.8, plugin LiveLinkFreeD, CineCameraActor + LensFile |
 | Tracking | libsurvive + pysurvive, **pas de SteamVR, pas de casque** |
 | Trackers | 3 × Vive Tracker 3.0, **USB direct** (pas de dongle, pas d'appairage) |
-| Contrôleurs | 2, uniquement pour le relevé du plateau |
+| Relevé du plateau | **1 tracker de plus**, sans fil via son dongle Watchman — décidé le 31 août 2026, voir §2bis |
 | Base stations | 2 × SteamVR 2.0, **plafond**, entre l'écran et la position caméra la plus reculée, angulées vers la médiane, regardant vers le bas |
 | Hub | **alimenté, 3 A minimum, et multi-TT** — voir ci-dessous. 3 × ~500 mA + répéteurs des rallonges actives |
 
@@ -48,6 +48,28 @@ cher (perte de tour sur un axe multi-tour).
 
 HTC recommande plus de 2 m de haut et 25–35° vers le bas ; champ 150° H,
 110° V. Les stations 2.0 n'ont pas besoin de se voir.
+
+### 2bis. Le relevé du plateau se fait avec un tracker, pas un contrôleur
+
+Décidé le 31 août 2026, après essai. Les contrôleurs sont **abandonnés**.
+
+Un contrôleur Vive s'appaire au **casque** — qu'on n'a pas — et n'est pas
+livré avec un dongle. Le rendre sans fil imposerait de réappairer sous
+Windows un dongle prévu pour un tracker, qui cesserait alors de servir au
+sien. Et en filaire, il faut traîner une rallonge active jusqu'aux deux coins
+de l'écran puis sous la caméra.
+
+Un **quatrième tracker** résout tout : son dongle est dans la boîte, sa base
+est plate — donc son centre suivi est net et surtout **répétable** aux trois
+poses, ce qu'exige le §8 —, et il devient une pièce de rechange pour
+n'importe laquelle des trois autres fonctions, ce que le modèle des rôles du
+§4 rend immédiat.
+
+Le sans-fil ne gêne pas ici : le relevé moyenne 3 s sur un point immobile, et
+la console annonce l'incertitude obtenue.
+
+Reste à confirmer que tracker et dongle sortent appairés d'usine. Sinon, un
+passage par SteamVR sous Windows, **une fois**.
 
 **Le hub doit être multi-TT.** Découvert le 31 août 2026 : avec quatre
 appareils sur un hub Genesys `05e3:0608` — *single-TT* —, libsurvive plante
@@ -293,8 +315,8 @@ la caméra. Chacun 3 s, moyenné.
 
 Trois points **non alignés** déterminent le plan entièrement. Deux ne
 suffisent pas : ils imposent au plan de les contenir, il reste un degré de
-liberté — le pivot autour de la droite qui les joint. Les deux contrôleurs
-posés sur la médiane laisseraient donc libre le **roulis du sol**, c'est-à-dire
+liberté — le pivot autour de la droite qui les joint. Deux points posés sur
+la médiane laisseraient donc libre le **roulis du sol**, c'est-à-dire
 l'inclinaison de l'horizon virtuel.
 
 La console propage le bruit mesuré de chaque pose et annonce l'incertitude
@@ -395,7 +417,7 @@ appliqué après coup la calibration du zoom au focus, silencieusement.
 `SimpleObject` garde le pointeur C dans `.ptr` et la fonction est dans le
 module — c'est ce que fait `survive_clock.object_names()`, sur lequel la
 console et le bridge s'appuient tous les deux. Préfixes : `LHR-` pour un
-tracker ou un contrôleur, `LHB-` pour une base station.
+tracker, `LHB-` pour une base station.
 
 **Ne pas extrapoler la pose caméra.** Un échantillon objectif plus récent que
 tout l'historique caméra est **différé d'un tick** (purge à 200 ms).
@@ -405,7 +427,7 @@ L'accepter en extrapolant revient exactement au comportement naïf.
 sortie, pas à l'historique : la soustraction pour le zoom et le focus doit se
 faire dans le repère où les deux trackers sont exprimés.
 
-**Contrôleurs posés à plat, même orientation aux trois relevés.** Le centre
+**Tracker de relevé posé à plat, même orientation aux trois relevés.** Le centre
 suivi est quelques cm au-dessus du sol ; comme le décalage est identique
 partout, il s'annule dans le plan et l'orientation. Il ne reste qu'un
 scalaire, `--floor-offset-mm`, à mesurer une fois au réglet.
@@ -484,7 +506,9 @@ multi-tour et un décrochage optique long peut coûter un tour (le bridge
 affiche `DROPOUT`). Un pignon plus grand ramènerait la course sous un tour et
 supprimerait le problème.
 
-**`--floor-offset-mm`.** À mesurer au réglet sur le contrôleur réel.
+**`--floor-offset-mm`.** À mesurer au réglet sur le tracker de relevé réel.
+Il diffère d'un modèle d'appareil à l'autre : à refaire si le rôle `survey`
+change d'appareil.
 
 **RTX 4070 Super ou 4080** sur la station Ubuntu. v2 dit 4080, Patrice dit
 4070 Super.

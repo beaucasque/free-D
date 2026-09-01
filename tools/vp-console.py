@@ -987,15 +987,16 @@ def demo_poses(t, phase, sweeping=False):
     q_move = _q(r @ np.asarray(ax, float), ang)
 
     out = {}
-    # Trois positions au sol. En vrai tu n'as que deux controleurs et tu en
-    # deplaces un ; la demo les montre simultanement pour que les trois
-    # releves s'enchainent sans manipulation.
+    # Trois positions au sol. En vrai tu n'as qu'UN appareil de releve — le
+    # quatrieme tracker, §2bis — que tu deplaces d'un point a l'autre ; la
+    # demo en montre trois a la fois pour que les releves s'enchainent sans
+    # manipulation. La console, elle, exige bien un seul appareil par point.
     # Chaque appareil porte son propre instant d'echantillonnage. Les
     # trackers d'objectif sont echantillonnes 3 ms avant la camera : c'est le
     # decalage que l'horloge doit rendre visible et que le slerp doit annuler.
-    out["DEMO-CTRL1"] = (to_s([0.0, -2.0, 0.031] + n()), (1.0, 0, 0, 0), t)
-    out["DEMO-CTRL2"] = (to_s([0.0, 2.0, 0.031] + n()), (1.0, 0, 0, 0), t)
-    out["DEMO-CTRL3"] = (to_s([4.2, 0.06, 0.031] + n()), (1.0, 0, 0, 0), t)
+    out["DEMO-SURV1"] = (to_s([0.0, -2.0, 0.031] + n()), (1.0, 0, 0, 0), t)
+    out["DEMO-SURV2"] = (to_s([0.0, 2.0, 0.031] + n()), (1.0, 0, 0, 0), t)
+    out["DEMO-SURV3"] = (to_s([4.2, 0.06, 0.031] + n()), (1.0, 0, 0, 0), t)
     out["DEMO-CAM"] = (to_s([4.2, 0.06, 1.35] + n(0.001)), q_move, t)
 
     lens_axis = tuple(r @ np.array([1.0, 0.0, 0.0]))
@@ -1911,8 +1912,8 @@ def _selftest_run():
     assert hub.clock.scale is not None, "l'horloge aurait du se resoudre"
 
     # -- studio ---------------------------------------------------------
-    for slot, dev in (("left", "DEMO-CTRL1"), ("right", "DEMO-CTRL2"),
-                      ("camera", "DEMO-CTRL3")):
+    for slot, dev in (("left", "DEMO-SURV1"), ("right", "DEMO-SURV2"),
+                      ("camera", "DEMO-SURV3")):
         hub.studio_capture(slot, [dev], seconds=1.5)
         assert wait(lambda: hub.capture is None), "releve %s bloque" % slot
     hub.studio_solve(floor_offset_mm=31.0, screen_mm=4000.0)
@@ -1937,7 +1938,7 @@ def _selftest_run():
 
     # Un point releve avec DEUX appareils poses a deux endroits : la moyenne
     # donnerait leur milieu, un point qui n'existe nulle part.
-    hub.studio_capture("camera", ["DEMO-CTRL3", "DEMO-CTRL1"], seconds=1.5)
+    hub.studio_capture("camera", ["DEMO-SURV3", "DEMO-SURV1"], seconds=1.5)
     assert wait(lambda: hub.capture is None), "releve a deux bloque"
     hub.world = None
     hub.studio_solve()
@@ -1946,7 +1947,7 @@ def _selftest_run():
     print("garde     : un point releve avec deux appareils -> refuse")
 
     # On refait ce point proprement pour la suite de l'enchainement.
-    hub.studio_capture("camera", ["DEMO-CTRL3"], seconds=1.5)
+    hub.studio_capture("camera", ["DEMO-SURV3"], seconds=1.5)
     assert wait(lambda: hub.capture is None), "releve camera bloque"
     hub.studio_solve(floor_offset_mm=31.0, screen_mm=4000.0)
     assert hub.world, hub.msg
@@ -1955,7 +1956,7 @@ def _selftest_run():
     hub.set_role("camera", "DEMO-CAM")
     hub.set_role("zoom", "DEMO-ZOO")
     hub.set_role("focus", "DEMO-FOC")
-    hub.set_role("survey", "DEMO-CTRL1")
+    hub.set_role("survey", "DEMO-SURV1")
     assert hub.roles["camera"] == "DEMO-CAM", hub.roles
     # Un appareil, un role : le second appel doit etre refuse.
     hub.set_role("focus", "DEMO-ZOO")
@@ -1983,7 +1984,7 @@ def _selftest_run():
     # effacer la calibration qui en dependait : elle a ete relevee sur un
     # autre montage et donnerait des valeurs plausibles et fausses.
     assert set(hub.axes) == {"focus", "zoom"}
-    hub.set_role("focus", "DEMO-CTRL2")
+    hub.set_role("focus", "DEMO-SURV2")
     assert "focus" not in hub.axes, hub.axes
     assert "zoom" in hub.axes, "le zoom n'avait pas a bouger"
     print("garde     : axe reassigne -> sa calibration est effacee")
@@ -1991,7 +1992,7 @@ def _selftest_run():
     # Remplacer la CAMERA fait tomber les deux axes : ils sont calibres en
     # relatif camera (cal["ref"] = conj(q_cam) * q_objectif).
     hub.set_role("focus", "DEMO-FOC")
-    hub.set_role("camera", "DEMO-CTRL3")
+    hub.set_role("camera", "DEMO-SURV3")
     assert hub.axes == {}, hub.axes
     print("garde     : camera remplacee -> les deux axes tombent")
 
