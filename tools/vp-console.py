@@ -492,6 +492,16 @@ class Hub:
                     self.msg = "%s : %d echantillons, il en faut 20." \
                         % (k, len(s))
                     return
+                # Un point au sol est releve avec UN appareil. Si deux
+                # appareils poses a deux endroits ont alimente le meme
+                # point, la moyenne donnerait leur milieu — un point qui
+                # n'existe nulle part, et rien ne le signalerait. On
+                # refuse plutot que de resoudre sur du faux.
+                srcs = sorted({d for d, _p in s})
+                if len(srcs) > 1:
+                    self.msg = ("%s : releve avec %d appareils (%s). Un seul "
+                                "par point." % (k, len(srcs), ", ".join(srcs)))
+                    return
                 a = np.array([p for _d, p in s], float)
                 means[k] = a.mean(axis=0)
                 sems[k] = a.std(axis=0) / math.sqrt(len(a))
@@ -727,6 +737,12 @@ class Hub:
                                "left": max(0.0, self.capture[2] - now)}
                               if self.capture else None)
             out["slots"] = {k: len(v) for k, v in self.slots.items()}
+            # Quel appareil a servi a chaque point : verifiable d'un coup
+            # d'oeil avant de resoudre.
+            out["slot_src"] = {
+                k: (sorted({d for d, _p in v})[0] if len({d for d, _p in v}) == 1
+                    else (", ".join(sorted({d for d, _p in v})) if v else None))
+                for k, v in self.slots.items()}
             out["world"] = self.world
             out["world_report"] = self.world_report
 
@@ -1002,6 +1018,8 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
       l'identifier : la colonne de droite compte les mètres parcourus.</p>
     </div>
     <div class="card"><h3>Relevé — 3 points</h3>
+      <div class="row" style="margin-bottom:10px"><label>Appareil</label>
+        <select id="sel-survey"></select></div>
       <div id="slots"></div>
       <p class="note">Trois points non alignés déterminent le plan. Deux
       laisseraient libre le roulis du sol, donc l'inclinaison de l'horizon
@@ -1142,9 +1160,12 @@ function build(){
     const row=el("div","kv");
     row.appendChild(el("span",null,lab));
     const b=el("button",null,"Relever");b.onclick=()=>{
-      const d=[...document.querySelectorAll("#devs tr.sel")].map(r=>r.dataset.id);
-      if(!d.length){alert("Sélectionne au moins un appareil dans la liste.");return}
-      go("studio_capture="+k+"&devices="+d.join(","))};
+      // UN seul appareil par point. Le releve moyenne les echantillons
+      // recus ; en accepter deux, poses a deux endroits, donnerait
+      // silencieusement leur milieu.
+      const d=$("sel-survey").value;
+      if(!d){alert("Aucun appareil disponible pour le relevé.");return}
+      go("studio_capture="+k+"&devices="+encodeURIComponent(d))};
     const n=el("b","mono","0");n.id="slot-"+k;
     row.appendChild(n);row.appendChild(b);sl.appendChild(row)});
 
@@ -1311,6 +1332,12 @@ function devices(s){
     tr.appendChild(el("td","mono",d.role||"—"));
     tr.appendChild(el("td","mono",d.travel.toFixed(1)+" m"));
     tb.appendChild(tr)}
+  {// L'appareil de releve se pose au sol : ce n'est ni la camera ni un
+   // tracker fixe dessus. On propose tout sauf la camera declaree.
+   const e=$("sel-survey"),cur=e.value;e.innerHTML="";
+   const list=s.devices.filter(d=>d.id!==s.camera);
+   list.forEach(d=>e.appendChild(el("option",null,d.id)));
+   if(cur&&list.some(d=>d.id===cur))e.value=cur;}
   for(const id of ["sel-cam","sel-lens"]){
     const e=$(id),cur=e.value;e.innerHTML="";
     // Le tracker camera ne peut pas servir d'axe d'objectif : la console le
@@ -1323,7 +1350,11 @@ function devices(s){
 
 function studio(s){
   for(const k in s.slots)
-    {const e=$("slot-"+k);if(e)e.textContent=s.slots[k]}
+    {const e=$("slot-"+k);if(e){
+       const n=s.slots[k],src=(s.slot_src||{})[k];
+       e.textContent=n;
+       e.title=src?("relevé avec "+src):"";
+       e.style.color=n?"var(--ok)":"var(--dim)"}}
   if(s.capture)$("msg").textContent="Relevé "+s.capture.slot+" — "
     +s.capture.left.toFixed(1)+" s";
   const r=s.world_report,w=s.world;
@@ -1739,6 +1770,22 @@ def _selftest_run():
     assert hub.world is None, "deux points colineaires auraient du etre refuses"
     print("garde     : trois points confondus -> refuse")
     hub.slots["camera"] = saved
+
+    # Un point releve avec DEUX appareils poses a deux endroits : la moyenne
+    # donnerait leur milieu, un point qui n'existe nulle part.
+    hub.studio_capture("camera", ["DEMO-CTRL3", "DEMO-CTRL1"], seconds=1.5)
+    assert wait(lambda: hub.capture is None), "releve a deux bloque"
+    hub.world = None
+    hub.studio_solve()
+    assert hub.world is None, "deux appareils sur un point auraient du etre refuses"
+    assert "appareils" in hub.msg, hub.msg
+    print("garde     : un point releve avec deux appareils -> refuse")
+
+    # On refait ce point proprement pour la suite de l'enchainement.
+    hub.studio_capture("camera", ["DEMO-CTRL3"], seconds=1.5)
+    assert wait(lambda: hub.capture is None), "releve camera bloque"
+    hub.studio_solve(floor_offset_mm=31.0, screen_mm=4000.0)
+    assert hub.world, hub.msg
 
     # -- objectifs -------------------------------------------------------
     hub.set_camera("DEMO-CAM")
