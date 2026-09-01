@@ -1,9 +1,3 @@
-# Titre
-
-driver_vive: fix two crashes in the USB transfer callback
-
-# Corps (à coller tel quel dans la description)
-
 Two independent problems in `handle_transfer()`, libusb's
 transfer-completion callback, both reached the moment a transfer fails — an
 unplugged device, a long optical dropout, a tracker powering off, or bus

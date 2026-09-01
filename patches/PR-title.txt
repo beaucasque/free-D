@@ -1,0 +1,1 @@
+driver_vive: fix two crashes in the USB transfer callback

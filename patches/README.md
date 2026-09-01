@@ -41,7 +41,7 @@ chemin-là ne l'utilisait pas.
 
 **Amont.** Poussé le 1er septembre 2026 sur
 `beaucasque/libsurvive`, branche `submit/no-free-inflight`. Pull request pas
-encore ouverte. Voir `PR-libsurvive.md`.
+encore ouverte. Voir `PR-body.md` (description) et `PR-title.txt` (titre).
 
 **Attention :** ce correctif seul **ne suffit pas**. Il traite une réentrance
 réelle mais secondaire ; la cause du plantage observé est dans le patch 0002.
@@ -80,4 +80,4 @@ débranchement.
 <https://github.com/beaucasque/libsurvive>, qui porte les deux correctifs.
 Ouvrir la PR :
 <https://github.com/beaucasque/libsurvive/pull/new/submit/no-free-inflight>,
-en collant `PR-libsurvive.md`.
+en collant `PR-title.txt` dans le titre et `PR-body.md` dans la description.
