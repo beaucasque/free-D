@@ -24,10 +24,19 @@ Description=Console free-D (relevé, calibration, test, sortie Free-D)
 Conflicts=vp-bridge.service
 After=network.target
 
+# ECOUTE RESEAU. La console est pilotee depuis un autre poste (le Mac), donc
+# elle ecoute sur 0.0.0.0. A savoir : elle n'a AUCUNE authentification, et son
+# /cmd ecrit roles.json, world.json et axes.json. Acceptable sur un LAN de
+# studio, a ne pas exposer au-dela.
+#
+# Pour la restreindre a la machine locale, remplacer VP_HOST par 127.0.0.1 et
+# passer par un tunnel :  ssh -L 8410:localhost:8410 unreal
+
 [Service]
 Type=simple
+Environment=VP_HOST=0.0.0.0
 WorkingDirectory=%h/free-D
-ExecStart=%h/free-D/tools/vp-console.py --host 127.0.0.1 --port 8410
+ExecStart=%h/free-D/tools/vp-console.py --host ${VP_HOST} --port 8410
 Restart=on-failure
 RestartSec=3
 StandardOutput=journal

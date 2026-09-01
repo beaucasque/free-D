@@ -281,7 +281,7 @@ if [ "$DO_UNIT" = 1 ]; then
     if [ "$unit" = "vp-bridge" ]; then
         exec_line="ExecStart=$PY $REPO/bridge/vp_bridge.py --source survive --host 127.0.0.1 --rate 60"
     else
-        exec_line="ExecStart=$PY $REPO/tools/vp-console.py --host 127.0.0.1 --port 8410"
+        exec_line="ExecStart=$PY $REPO/tools/vp-console.py --host \${VP_HOST} --port 8410"
     fi
     if [ "$DRY" = 1 ]; then
         info "[dry-run] generation de $UNIT_DIR/$unit.service"
