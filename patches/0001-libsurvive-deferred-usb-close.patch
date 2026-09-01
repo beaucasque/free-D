@@ -1,28 +1,43 @@
-From 8b62adcf4c68685560db1ffa44c435b224909bdf Mon Sep 17 00:00:00 2001
+From 1ce425ec0f7c2ced44864146ddd587716d2d82fa Mon Sep 17 00:00:00 2001
 From: beaucasque <kariboumedia@gmail.com>
-Date: Mon, 31 Aug 2026 21:15:42 -0400
-Subject: [PATCH] driver_vive: defer USB close out of the libusb transfer
- callback
+Date: Mon, 31 Aug 2026 21:29:11 -0400
+Subject: [PATCH] driver_vive.libusb.h: survive_disconnect_device: defer close
+ out of the transfer callback
 
 handle_transfer() is libusb's transfer-completion callback: it runs on the
 event thread while libusb holds the current transfer's locks. On a
 non-COMPLETED status it reached survive_disconnect_device(), which called
 survive_close_usb_device() synchronously. That function calls
 libusb_cancel_transfer() on every interface -- including the one whose
-callback is executing -- and survive_config_cancel() does the same.
+callback is currently executing -- and survive_config_cancel() reaches
+libusb the same way.
 
-Re-entering libusb from inside its own callback makes pthread_mutex_lock
-fail, and usbi_mutex_lock() (os/threads_posix.h) asserts, aborting the
-process.
+Re-entering libusb from inside its own callback makes pthread_mutex_lock()
+fail, so usbi_mutex_lock() (os/threads_posix.h) asserts and the process
+aborts:
 
-Reproduced with four full-speed trackers behind a single-TT hub, where TT
-saturation makes a transfer fail at startup: crash within 2.7 s, every time.
+    Warning: 2.703381 T23 Device disconnect: 1
+    python: ../../libusb/os/threads_posix.h:46: usbi_mutex_lock:
+            Assertion `pthread_mutex_lock(mutex) == 0' failed.
+
+Reproduced consistently with four full-speed Vive trackers behind a
+single-TT USB 2.0 hub: transaction-translator saturation makes a transfer
+fail about 2.7 s after start, and the process dies every time. Three
+trackers on the same hub ran for hours without an error. Moving to a
+multi-TT hub removes the trigger but not the latent bug -- any failing
+transfer reaches this path, including an optical dropout or a tracker
+powering off.
 
 survive_disconnect_device() now only marks the interfaces down and raises
 request_disconnect. The poll loop in survive_usb_poll() consumes it and
 calls survive_close_usb_device() off-callback, where no libusb lock is
-held. The transfer being handled is still cleaned up as before by the
-shutdown: label at the end of handle_transfer().
+held. This mirrors the existing request_close mechanism, which is already
+consumed from the same loop -- the deferral scheme was there, this path
+simply did not use it.
+
+The transfer being handled is still cleaned up as before by the shutdown:
+label at the end of handle_transfer(), so per-transfer accounting
+(active_transfers, request_close) is unchanged.
 ---
  src/driver_vive.c        | 10 ++++++++++
  src/driver_vive.libusb.h | 23 ++++++++++++++++++++++-
