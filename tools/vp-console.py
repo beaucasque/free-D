@@ -1117,6 +1117,14 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
 .hb .chip{padding:2px 8px;border:1px solid var(--rule);border-radius:10px;
   color:var(--dim);white-space:nowrap}
 .hb .chip b{color:var(--ink);font-weight:600}
+/* Les valeurs changent de largeur quand elles passent de 1 a 2 ou 3
+   chiffres, et tout ce qui suit se decale lateralement. On leur reserve une
+   largeur fixe, en ch puisque la police est a chasse fixe, et on cale a
+   droite : la pastille ne bouge plus, seule la valeur change. */
+.hb .chip b.v{display:inline-block;text-align:right}
+/* Les chips eux-memes gardent une largeur minimale, pour que la disparition
+   d'un suffixe optionnel ne fasse pas non plus glisser les voisins. */
+.hb .chip{min-width:max-content}
 .hb .alarm{color:var(--bad);border-color:var(--bad)}
 .hb .warn2{color:var(--warn);border-color:var(--warn)}
 .bar{padding:9px 16px;border-top:1px solid var(--rule);background:var(--panel2);
@@ -1463,6 +1471,14 @@ function health(s){
   const box=$("hb");const c=[];
   const lamp=k=>'<span class="lamp" style="background:'+k+'"></span>';
   const ok="var(--ok)",wr="var(--warn)",bd="var(--bad)";
+  // v(valeur, largeur en caracteres) : reserve la place du plus grand cas
+  const v=(x,w)=>'<b class="v" style="min-width:'+w+'ch">'+x+'</b>';
+  // Un age s'etale de 5 ms a plusieurs minutes. On le raccourcit pour qu'il
+  // tienne dans une largeur fixe, plutot que de reserver six chiffres.
+  const age=ms=>ms<1000?(ms.toFixed(0)+" ms")
+    :ms<90000?((ms/1000).toFixed(1)+" s")
+    :ms<5400000?((ms/60000).toFixed(0)+" min")
+    :((ms/3600000).toFixed(1)+" h");
 
   // horloge — le §6bis en fait la condition de tout le reste
   c.push('<span class="chip'+(H.clock_ok?'':' warn2')+'">'
@@ -1472,30 +1488,30 @@ function health(s){
   const gone=H.n_gone||0;
   c.push('<span class="chip'+(H.n_dev?(gone?' alarm':''):' alarm')+'">'
     +lamp(H.n_dev?(gone?bd:ok):bd)
-    +'<b>'+H.n_dev+'</b> appareils'
-    +(gone?(' · <b>'+gone+'</b> DISPARU'+(gone>1?'S':'')):'')
-    +(H.n_assigned?(' · <b>'+H.n_assigned+'</b> en service'):'')+'</span>');
+    +v(H.n_dev,2)+' appareils'
+    +(gone?(' · '+v(gone,1)+' DISPARU'+(gone>1?'S':'')):'')
+    +(H.n_assigned?(' · '+v(H.n_assigned,1)+' en service'):'')+'</span>');
 
   // debit du plus lent
   const rl=H.min_rate>=100?ok:(H.min_rate>=40?wr:bd);
   c.push('<span class="chip'+(rl===ok?'':(rl===wr?' warn2':' alarm'))+'">'
-    +lamp(rl)+'débit min <b>'+H.min_rate.toFixed(0)+'</b> Hz</span>');
+    +lamp(rl)+'débit min '+v(H.min_rate.toFixed(0),4)+' Hz</span>');
 
   // fraicheur de la pose la plus vieille
   const al=H.worst_age_ms<50?ok:(H.worst_age_ms<200?wr:bd);
   c.push('<span class="chip'+(al===ok?'':(al===wr?' warn2':' alarm'))+'">'
-    +lamp(al)+'pose la + vieille <b>'+H.worst_age_ms.toFixed(0)+'</b> ms</span>');
+    +lamp(al)+'pose la + vieille '+v(age(H.worst_age_ms),7)+'</span>');
 
   // decrochages : ce qui coute un tour sur un axe multi-tour
   const dl=H.drops===0?ok:bd;
   c.push('<span class="chip'+(dl===ok?'':' alarm')+'">'+lamp(dl)
-    +'décrochages <b>'+H.drops+'</b>'
-    +(H.worst_gap_ms>20?(' · trou '+H.worst_gap_ms.toFixed(0)+' ms'):'')
+    +'décrochages '+v(H.drops,3)
+    +(H.worst_gap_ms>20?(' · trou '+v(H.worst_gap_ms.toFixed(0),5)+' ms'):'')
     +'</span>');
 
   // base stations lues dans la config libsurvive
   c.push('<span class="chip'+(H.lh_seen>=2?'':' warn2')+'">'
-    +lamp(H.lh_seen>=2?ok:wr)+'<b>'+H.lh_seen+'</b> base stations</span>');
+    +lamp(H.lh_seen>=2?ok:wr)+v(H.lh_seen,1)+' base stations</span>');
 
   // une calibration de demo sur le disque serait relue par le bridge
   if(H.demo_cal)
