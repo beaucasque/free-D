@@ -76,8 +76,9 @@ tracker débranché en marche, `NRestarts` reste à 0, même PID de part et
 d'autre, zéro assertion. Avant, le processus mourait à l'instant du
 débranchement.
 
-**Amont.** Branche `submit/no-free-inflight` sur
-<https://github.com/beaucasque/libsurvive>, qui porte les deux correctifs.
-Ouvrir la PR :
-<https://github.com/beaucasque/libsurvive/pull/new/submit/no-free-inflight>,
-en collant `PR-title.txt` dans le titre et `PR-body.md` dans la description.
+**Amont.** Soumis avec le 0001 dans
+[collabora/libsurvive#372](https://github.com/collabora/libsurvive/pull/372)
+— 2 commits, +36/−2. `PR-title.txt` et `PR-body.md` gardent le texte envoyé.
+
+**Retirer ces deux patches d'ici** dès que la PR est fusionnée : `install.sh`
+recompilera alors sur `origin/master` seul.
