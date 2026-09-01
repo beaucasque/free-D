@@ -38,7 +38,7 @@ Windows ne sert plus qu'aux mises à jour de firmware des trackers.
 | Trackers | 3 × Vive Tracker 3.0, **USB direct** (pas de dongle, pas d'appairage) |
 | Contrôleurs | 2, uniquement pour le relevé du plateau |
 | Base stations | 2 × SteamVR 2.0, **plafond**, entre l'écran et la position caméra la plus reculée, angulées vers la médiane, regardant vers le bas |
-| Hub | USB 2.0 **alimenté, 3 A minimum** (3 × ~500 mA + répéteurs des rallonges actives) |
+| Hub | **alimenté, 3 A minimum, et multi-TT** — voir ci-dessous. 3 × ~500 mA + répéteurs des rallonges actives |
 
 Montage des trackers d'objectif : **un de chaque côté du bloc optique**. Avec
 les base stations à gauche et à droite, monter les deux du même côté ferait
@@ -48,6 +48,33 @@ cher (perte de tour sur un axe multi-tour).
 
 HTC recommande plus de 2 m de haut et 25–35° vers le bas ; champ 150° H,
 110° V. Les stations 2.0 n'ont pas besoin de se voir.
+
+**Le hub doit être multi-TT.** Découvert le 31 août 2026 : avec quatre
+appareils sur un hub Genesys `05e3:0608` — *single-TT* —, libsurvive plante
+en 2,7 s, systématiquement (`Device disconnect` puis assertion dans libusb,
+core dump). Avec trois, la même chaîne tournait des heures sans un
+décrochage.
+
+Les trackers sont en **full-speed, 12 Mb/s**. Derrière un hub USB 2.0 ils
+passent par un *transaction translator*, et un hub single-TT n'en a qu'un
+pour tous ses ports : l'enveloppe sature au quatrième appareil. Un hub
+multi-TT en a un par port.
+
+Vérifier avant d'acheter comme avant de brancher :
+
+```bash
+cat /sys/bus/usb/devices/<hub>/bDeviceProtocol   # 02 = multi-TT
+```
+
+Attention : un hub « USB 3.0 » est **deux hubs dans un boîtier**, un
+SuperSpeed et un USB 2.0. Les trackers étant full-speed, c'est le
+`bDeviceProtocol` de la partie **2.0** qui compte, pas l'étiquette sur la
+boîte. Un Realtek RTS5411 (`0bda:5411`) convient : quatre appareils y
+tiennent à 240 Hz sans décrochage.
+
+L'assertion est levée **dans libusb, en C** : Python ne peut pas
+l'intercepter. Un décrochage USB en tournage tuerait donc le bridge net.
+`vp-bridge.service` a `Restart=on-failure` ; la console, elle, n'a rien.
 
 ---
 
