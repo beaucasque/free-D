@@ -804,10 +804,17 @@ class Hub:
             now = time.monotonic()
             devs = []
             for k, d in sorted(self.dev.items()):
+                age = now - d["t"]
+                # Un appareil qui ne remonte plus rien garde une file
+                # d'horodatages figee : calculer un debit dessus afficherait
+                # 240 Hz pour un tracker debranche depuis neuf minutes. Vu en
+                # vrai le 1er septembre 2026. Passe ce delai, il est absent,
+                # et on le dit plutot que de le laisser paraitre sain.
+                gone = age > 1.0
                 ts = d.get("ts")
                 rate = gap = 0.0
                 drops = 0
-                if ts and len(ts) > 4:
+                if not gone and ts and len(ts) > 4:
                     span = ts[-1] - ts[0]
                     if span > 1e-3:
                         rate = (len(ts) - 1) / span
@@ -834,7 +841,8 @@ class Hub:
                         xy = None
 
                 devs.append({"id": k, "travel": round(d["travel"], 2),
-                             "age_ms": (now - d["t"]) * 1000.0,
+                             "age_ms": age * 1000.0,
+                             "gone": gone,
                              "rate": round(rate, 1),
                              "gap_ms": round(gap * 1000.0, 1),
                              "drops": drops,
@@ -893,9 +901,11 @@ class Hub:
             # trackers commande : c'est lui qui gatera la mesure.
             assigned = [d for d in devs if d["role"]]
             watch = assigned or devs
+            gone = [d for d in devs if d["gone"]]
             out["health"] = {
                 "clock_ok": self.clock.scale is not None,
-                "n_dev": len(devs),
+                "n_dev": len(devs) - len(gone),
+                "n_gone": len(gone),
                 "n_assigned": len(assigned),
                 "worst_age_ms": round(max([d["age_ms"] for d in watch],
                                           default=0.0), 1),
@@ -1459,8 +1469,11 @@ function health(s){
     +lamp(H.clock_ok?ok:wr)+(s.clock||"horloge inconnue")+'</span>');
 
   // trackers vus / en service
-  c.push('<span class="chip'+(H.n_dev?'':' alarm')+'">'+lamp(H.n_dev?ok:bd)
+  const gone=H.n_gone||0;
+  c.push('<span class="chip'+(H.n_dev?(gone?' alarm':''):' alarm')+'">'
+    +lamp(H.n_dev?(gone?bd:ok):bd)
     +'<b>'+H.n_dev+'</b> appareils'
+    +(gone?(' · <b>'+gone+'</b> DISPARU'+(gone>1?'S':'')):'')
     +(H.n_assigned?(' · <b>'+H.n_assigned+'</b> en service'):'')+'</span>');
 
   // debit du plus lent
@@ -1492,6 +1505,11 @@ function health(s){
   box.innerHTML=c.join("");
 }
 
+function fmtAge(ms){const s=ms/1000;
+  if(s<90)return s.toFixed(0)+" s";
+  if(s<5400)return (s/60).toFixed(0)+" min";
+  return (s/3600).toFixed(1)+" h"}
+
 function devices(s){
   const tb=$("devs");const sel=new Set([...tb.querySelectorAll("tr.sel")]
     .map(r=>r.dataset.id));
@@ -1502,11 +1520,20 @@ function devices(s){
     tr.style.cursor="pointer";
     tr.onclick=()=>tr.classList.toggle("sel");
     const c1=el("td");
-    const dot=el("span","dot"+(d.age_ms<200?" ok":d.age_ms<1000?" warn":""));
+    const dot=el("span","dot"+(d.gone?"":(d.age_ms<200?" ok":" warn")));
+    if(d.gone)dot.style.background="var(--bad)";
     c1.appendChild(dot);c1.appendChild(document.createTextNode(d.id));
     tr.appendChild(c1);
     tr.appendChild(el("td","mono",d.role||"—"));
-    tr.appendChild(el("td","mono",d.travel.toFixed(1)+" m"));
+    // Un appareil qui a disparu reste LISTE : le voir s'effacer en silence
+    // laisserait croire qu'il n'a jamais existe.
+    if(d.gone){
+      const g=el("td","mono","absent "+fmtAge(d.age_ms));
+      g.style.color="var(--bad)";tr.appendChild(g);
+      tr.style.opacity="0.65";
+    }else{
+      tr.appendChild(el("td","mono",d.travel.toFixed(1)+" m"));
+    }
     tb.appendChild(tr)}
 }
 

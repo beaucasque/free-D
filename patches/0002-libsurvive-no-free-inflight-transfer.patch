@@ -1,0 +1,64 @@
+From 32b5d7c6a52249fc1660fbb75e85505fcf4577f0 Mon Sep 17 00:00:00 2001
+From: beaucasque <kariboumedia@gmail.com>
+Date: Tue, 1 Sep 2026 01:51:12 -0400
+Subject: [PATCH] driver_vive.libusb.h: handle_transfer: do not free a
+ resubmitted transfer
+
+On a non-COMPLETED status, handle_transfer() retries by calling
+libusb_submit_transfer(). When that call SUCCEEDS it fell through to
+'goto disconnect', and from there into the shutdown: label, which runs
+libusb_free_transfer() on the transfer that was just resubmitted and is
+therefore in flight.
+
+libusb_free_transfer() destroys the transfer's mutex, but libusb still has
+the transfer in its flying-transfers list. The next event-loop pass locks
+that destroyed mutex, pthread_mutex_lock() fails, and usbi_mutex_lock()
+(os/threads_posix.h) asserts -- the process aborts:
+
+    Warning: 2.703381 T23 Device disconnect: 1
+    python: ../../libusb/os/threads_posix.h:46: usbi_mutex_lock:
+            Assertion `pthread_mutex_lock(mutex) == 0' failed.
+
+Observed by unplugging one of four wired Vive trackers while running: the
+process dies the instant the device goes away. Also reproducible through
+transaction-translator saturation on a single-TT USB 2.0 hub, where a
+transfer fails a couple of seconds after start.
+
+Return after a successful resubmit, so the retry actually gets a chance to
+run and the in-flight transfer is left alone. Only a failed resubmit still
+goes to shutdown:, which is correct -- nothing is in flight then.
+
+This also drops a duplicated increment: error_count was incremented twice
+per error (once on its own line, once inside the condition), so the retry
+budget was five failures rather than the ten the code reads as.
+---
+ src/driver_vive.libusb.h | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/driver_vive.libusb.h b/src/driver_vive.libusb.h
+index 7e55429..c5f5bee 100644
+--- a/src/driver_vive.libusb.h
++++ b/src/driver_vive.libusb.h
+@@ -248,11 +248,18 @@ static void handle_transfer(struct libusb_transfer *transfer) {
+ 	if (!iface->shutdown && transfer->status != LIBUSB_TRANSFER_COMPLETED) {
+ 		SV_WARN("%f %s Device disconnect: %d", survive_run_time(ctx), survive_colorize_codename(iface->assoc_obj),
+ 				transfer->status);
+-		iface->error_count++;
+ 		if (iface->error_count++ < 10) {
+ 			if (libusb_submit_transfer(transfer)) {
+ 				goto shutdown;
+ 			}
++
++			/* Resubmit succeeded: the transfer is IN FLIGHT again. Falling
++			   through to shutdown: would call libusb_free_transfer() on it,
++			   which destroys its mutex while libusb still holds it in the
++			   flying-transfers list. The next event-loop pass then locks a
++			   destroyed mutex and usbi_mutex_lock() asserts. Return and let
++			   the retry run its course. */
++			return;
+ 		}
+ 
+ 		goto disconnect;
+-- 
+2.34.1
+
