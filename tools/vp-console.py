@@ -64,6 +64,14 @@ import worldframe      # noqa: E402
 
 AXES_PATH = os.path.join(BRIDGE, "axes.json")
 WORLD_PATH = os.path.join(BRIDGE, "world.json")
+ROLES_PATH = os.path.join(BRIDGE, "roles.json")
+
+ROLES = [
+    ("camera", "Tracker CAMÉRA — sur la cage"),
+    ("zoom", "Tracker ZOOM — bague de zoom"),
+    ("focus", "Tracker FOCUS — bague de mise au point"),
+    ("survey", "Appareil de RELEVÉ — posé au sol, 3 points"),
+]
 
 PHASES = [
     ("repos", "Ne touche a rien. Camera immobile, bagues bloquees. "
@@ -161,6 +169,13 @@ class Hub:
         self._emit_t = 0.0
         self._emit_c = 0
         self.results = {}        # onglet Test : verdicts figes par phase
+
+        # Roles attribues a la main, une fois pour toutes, avant toute
+        # calibration. Ils portent des NUMEROS DE SERIE : le §8 interdit de
+        # lier un appareil a son rang d'enumeration, et on a la preuve que
+        # ce rang se decale.
+        self.roles = {}
+        self._load_roles()
         self.done = []
         self.ref = None
         self.msg = ""
@@ -476,8 +491,16 @@ class Hub:
 
     # -- studio -----------------------------------------------------------
 
-    def studio_capture(self, slot, devices, seconds=3.0):
+    def studio_capture(self, slot, devices=None, seconds=3.0):
         with self.lock:
+            # Un seul appareil, celui qui porte le role « releve ».
+            if not devices:
+                d = self.roles.get("survey")
+                if not d:
+                    self.msg = ("Aucun appareil n'a le role releve. "
+                                "Onglet Appareils.")
+                    return
+                devices = [d]
             self.slots[slot] = []
             self.capture = (slot, list(devices),
                             time.monotonic() + seconds)
@@ -563,16 +586,109 @@ class Hub:
 
     # -- objectifs ---------------------------------------------------------
 
-    def set_camera(self, dev):
-        with self.lock:
-            self.camera = dev
-            self.hist = lensaxis.CameraHistory(span=2.0)
-            self.msg = "Tracker camera : %s" % dev
+    # -- roles -------------------------------------------------------------
 
-    def sweep_start(self, name, dev):
+    def _load_roles(self):
+        try:
+            with open(ROLES_PATH) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            return
+        if isinstance(d, dict):
+            self.roles = {k: v for k, v in d.items()
+                          if k in dict(ROLES) and v}
+            if self.roles.get("camera"):
+                self.camera = self.roles["camera"]
+
+    def _save_roles(self):
+        try:
+            with open(ROLES_PATH, "w") as f:
+                json.dump(self.roles, f, indent=2)
+                f.write("\n")
+        except OSError as e:                              # noqa: BLE001
+            self.msg = "roles.json non ecrit : %s" % e
+
+    def set_role(self, role, dev):
+        """Attribue un role. Un appareil ne peut en tenir qu'un.
+
+        Assigner deux roles au meme appareil produirait des mesures qui ont
+        l'air justes : le zoom suivrait le focus, et rien ne le dirait.
+        """
         with self.lock:
+            if role not in dict(ROLES):
+                self.msg = "Role inconnu : %s" % role
+                return
+            if not dev:
+                self.roles.pop(role, None)
+                if role == "camera":
+                    self.camera = None
+                self._save_roles()
+                self.msg = "Role %s libere." % role
+                return
+            held = next((r for r, v in self.roles.items()
+                         if v == dev and r != role), None)
+            if held:
+                self.msg = ("%s tient deja le role %s. Un appareil, un role."
+                            % (dev, held))
+                return
+            before = self.roles.get(role)
+            self.roles[role] = dev
+            if role == "camera":
+                self.camera = dev
+                self.hist = lensaxis.CameraHistory(span=2.0)
+            self._save_roles()
+
+            dropped = self._invalidate(role, before, dev)
+            self.msg = "%s : %s" % (role, dev)
+            if dropped:
+                self.msg += (" — calibration de %s effacee, a refaire."
+                             % ", ".join(dropped))
+
+    def _invalidate(self, role, before, dev):
+        """Efface ce qu'un changement d'appareil rend caduc.
+
+        Remplacer un tracker physique et garder sa calibration donnerait des
+        valeurs plausibles et fausses, sans rien signaler. Deux cas :
+
+        - un axe change d'appareil : sa course et son axe de rotation ont ete
+          releves sur l'ancien montage, ils ne valent rien pour le nouveau ;
+        - la CAMERA change : les deux axes sont calibres en relatif camera
+          (cal["ref"] est un conj(q_cam)*q_objectif), donc les deux tombent.
+
+        world.json n'est pas touche : il vient des trois points au sol, pas
+        de la camera.
+        """
+        if before == dev:
+            return []
+        dropped = []
+        if role in ("zoom", "focus"):
+            if self.axes.pop(role, None) is not None:
+                dropped.append(role)
+        elif role == "camera":
+            for n in list(self.axes):
+                self.axes.pop(n)
+                dropped.append(n)
+        if dropped:
+            self.outs.clear()
+            lensaxis.save(AXES_PATH,
+                          {"camera": self.camera, "axes": self.axes})
+        return dropped
+
+    def set_camera(self, dev):
+        self.set_role("camera", dev)
+
+    def sweep_start(self, name, dev=None):
+        with self.lock:
+            # L'appareil vient du role attribue a l'onglet Appareils. Le
+            # menu du balayage a disparu : choisir la un tracker different
+            # de celui qui portera l'axe en production n'aurait aucun sens.
+            dev = dev or self.roles.get(name)
             if not self.camera:
-                self.msg = "Declare d'abord le tracker camera."
+                self.msg = "Attribue d'abord le role camera."
+                return
+            if not dev:
+                self.msg = ("Aucun tracker n'a le role %s. Onglet Appareils."
+                            % name)
                 return
             if dev == self.camera:
                 self.msg = "Le tracker objectif ne peut pas etre la camera."
@@ -765,6 +881,8 @@ class Hub:
             out["cam_rate"] = math.degrees(self.hist.rate())
             out["test"] = self._test_snapshot() if self.tap else None
             out["results"] = self.results
+            out["roles"] = dict(self.roles)
+            out["role_defs"] = [[k, lab] for k, lab in ROLES]
             out["freed"] = self.freed
             out["emit"] = {"on": self.sender is not None,
                            "to": ("%s:%d" % self.emit_to) if self.emit_to else "",
@@ -997,7 +1115,8 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
 
 <header>
   <h1>Console Free-D</h1>
-  <div class="tab on" data-t="studio">Studio<span class="chk" id="c-studio"></span></div>
+  <div class="tab on" data-t="dev">Appareils<span class="chk" id="c-dev"></span></div>
+  <div class="tab" data-t="studio">Studio<span class="chk" id="c-studio"></span></div>
   <div class="tab" data-t="axes">Objectifs<span class="chk" id="c-axes"></span></div>
   <div class="tab" data-t="test">Test<span class="chk" id="c-test"></span></div>
   <div class="tab" data-t="out">Sortie<span class="chk" id="c-out"></span></div>
@@ -1009,17 +1128,38 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
 <div class="hb" id="hb"><span class="chip">en attente…</span></div>
 
 <main>
-<!-- ------------------------------------------------- STUDIO -->
-<div class="pane on" id="p-studio"><div class="grid">
+<!-- ------------------------------------------------- APPAREILS -->
+<div class="pane on" id="p-dev"><div class="grid">
   <div>
     <div class="card"><h3>Appareils vus</h3>
       <table><tbody id="devs"></tbody></table>
       <p class="note" style="margin:9px 0 0">Bouge un appareil pour
-      l'identifier : la colonne de droite compte les mètres parcourus.</p>
+      l'identifier : la colonne de droite compte les mètres parcourus.
+      L'identifiant est le <b>numéro de série gravé</b> — <code>LHR-</code>
+      pour un tracker ou un joystick. Il ne change jamais, contrairement aux
+      noms <code>T20</code>, <code>T21</code>… de libsurvive, qui se
+      décalent dès qu'on branche un appareil de plus.</p>
     </div>
+  </div>
+  <div>
+    <div class="card"><h3>Rôles</h3>
+      <div id="roles"></div>
+      <p class="note">À faire <b>en premier</b>, avant tout relevé et toute
+      calibration. Un appareil ne peut tenir qu'un rôle.</p>
+      <p class="note">Si tu remplaces un tracker, réattribue simplement son
+      rôle ici : la calibration qui en dépendait est effacée et redemandée.
+      Changer le tracker <b>caméra</b> efface les deux axes — ils sont
+      calibrés en relatif caméra.</p>
+    </div>
+  </div>
+</div></div>
+
+<!-- ------------------------------------------------- STUDIO -->
+<div class="pane" id="p-studio"><div class="grid">
+  <div>
     <div class="card"><h3>Relevé — 3 points</h3>
-      <div class="row" style="margin-bottom:10px"><label>Appareil</label>
-        <select id="sel-survey"></select></div>
+      <p class="note" style="margin:0 0 10px">Relevé avec
+        <b id="survey-who">—</b></p>
       <div id="slots"></div>
       <p class="note">Trois points non alignés déterminent le plan. Deux
       laisseraient libre le roulis du sol, donc l'inclinaison de l'horizon
@@ -1050,15 +1190,11 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
 <!-- ------------------------------------------------- OBJECTIFS -->
 <div class="pane" id="p-axes"><div class="grid">
   <div>
-    <div class="card"><h3>Tracker caméra</h3>
-      <select id="sel-cam"></select>
-      <button style="margin-top:9px;width:100%" id="b-setcam">Déclarer</button>
-    </div>
     <div class="card"><h3>Balayage d'axe</h3>
       <label class="eyebrow">Axe</label>
       <select id="sel-axis"><option>focus</option><option>zoom</option></select>
-      <label class="eyebrow" style="display:block;margin-top:9px">Tracker</label>
-      <select id="sel-lens"></select>
+      <p class="note" style="margin:9px 0 0">Tracker :
+        <b id="lens-who">—</b> — attribué dans l'onglet Appareils.</p>
       <div style="display:flex;gap:8px;margin-top:11px">
         <button class="go" id="b-sw-start">Démarrer</button>
         <button class="stop" id="b-sw-stop">Arrêter</button>
@@ -1163,9 +1299,9 @@ function build(){
       // UN seul appareil par point. Le releve moyenne les echantillons
       // recus ; en accepter deux, poses a deux endroits, donnerait
       // silencieusement leur milieu.
-      const d=$("sel-survey").value;
-      if(!d){alert("Aucun appareil disponible pour le relevé.");return}
-      go("studio_capture="+k+"&devices="+encodeURIComponent(d))};
+      // L'appareil vient du role « relevé » (onglet Appareils) : le
+      // serveur le resout seul, et refuse si aucun n'est attribue.
+      go("studio_capture="+k)};
     const n=el("b","mono","0");n.id="slot-"+k;
     row.appendChild(n);row.appendChild(b);sl.appendChild(row)});
 
@@ -1178,9 +1314,8 @@ function build(){
   $("b-solve").onclick=()=>go("studio_solve=1&screen_mm="
     +($("screen-mm").value||0)+"&floor_off="+($("floor-off").value||0));
   $("b-wsave").onclick=()=>go("studio_save=1");
-  $("b-setcam").onclick=()=>go("set_camera="+encodeURIComponent($("sel-cam").value));
   $("b-sw-start").onclick=()=>{sweepBuf=ring(N);
-    go("sweep_start="+$("sel-axis").value+"&device="+encodeURIComponent($("sel-lens").value))};
+    go("sweep_start="+$("sel-axis").value)};
   $("b-sw-stop").onclick=()=>go("sweep_stop=1");
   $("b-arm").onclick=()=>go("test_arm=1");
   $("b-emit").onclick=()=>go("emit_start=1&ehost="
@@ -1199,7 +1334,47 @@ ev.onmessage=e=>{const s=JSON.parse(e.data);last=s;
   $("hdr").textContent=(s.camera?("caméra "+s.camera+" · "):"")+(s.clock||"");
   $("hdr").style.color=s.clock_ok?"var(--dim)":"var(--warn)";
   $("c-out").textContent=(s.emit&&s.emit.on)?"✓":"";
-  health(s);devices(s);studio(s);axes(s);test(s);outp(s)};
+  $("c-dev").textContent=(s.role_defs||[]).every(([k])=>s.roles&&s.roles[k])?"✓":"";
+  health(s);roles(s);devices(s);studio(s);axes(s);test(s);outp(s)};
+
+// Attribution des roles. Un menu par role, alimente par les appareils vus.
+// Un appareil deja pris est signale, et le serveur refuse : un appareil, un
+// role. Un appareil attribue mais absent de la liste (debranche) reste dans
+// le menu, en rouge, plutot que de disparaitre en silence.
+function roles(s){
+  const defs=s.role_defs||[],cur=s.roles||{},host=$("roles");
+  if(host.dataset.built!=="1"){
+    host.innerHTML="";host.dataset.built="1";
+    for(const [k,lab] of defs){
+      const row=el("div","row");row.style.cssText="align-items:center;gap:10px";
+      const l=el("label",null,lab);l.style.cssText="flex:1;font-size:12px";
+      const sel=el("select");sel.id="role-"+k;sel.style.minWidth="190px";
+      sel.onchange=()=>go("set_role="+k+"&device="+encodeURIComponent(sel.value));
+      row.appendChild(l);row.appendChild(sel);host.appendChild(row)}
+  }
+  for(const [k] of defs){
+    const sel=$("role-"+k);if(!sel)continue;
+    const want=cur[k]||"";
+    const opts=[""].concat(s.devices.map(d=>d.id));
+    if(want&&!opts.includes(want))opts.push(want);
+    const sig=opts.join("|")+"#"+want+"#"+JSON.stringify(cur);
+    if(sel.dataset.sig!==sig){
+      sel.dataset.sig=sig;sel.innerHTML="";
+      for(const id of opts){
+        const o=el("option");o.value=id;
+        const held=Object.entries(cur).find(([r,v])=>v===id&&r!==k);
+        o.textContent=id?(held?id+"  (déjà "+held[0]+")":id):"— aucun —";
+        if(id===want)o.selected=true;
+        sel.appendChild(o)}
+    }
+    const vu=s.devices.some(d=>d.id===want);
+    sel.style.color=want?(vu?"var(--ok)":"var(--bad)"):"var(--dim)";
+    sel.title=want&&!vu?"attribué mais pas vu — débranché ?":"";
+  }
+  const w=$("survey-who");
+  if(w){w.textContent=cur.survey||"aucun appareil de relevé";
+        w.style.color=cur.survey?"var(--ok)":"var(--warn)"}
+}
 
 // Verdicts figes au phase_stop. Le seuil est celui de l'onglet : 0,3 % de
 // la course est bon, 1 % passable, au-dela il faut refaire.
@@ -1332,20 +1507,6 @@ function devices(s){
     tr.appendChild(el("td","mono",d.role||"—"));
     tr.appendChild(el("td","mono",d.travel.toFixed(1)+" m"));
     tb.appendChild(tr)}
-  {// L'appareil de releve se pose au sol : ce n'est ni la camera ni un
-   // tracker fixe dessus. On propose tout sauf la camera declaree.
-   const e=$("sel-survey"),cur=e.value;e.innerHTML="";
-   const list=s.devices.filter(d=>d.id!==s.camera);
-   list.forEach(d=>e.appendChild(el("option",null,d.id)));
-   if(cur&&list.some(d=>d.id===cur))e.value=cur;}
-  for(const id of ["sel-cam","sel-lens"]){
-    const e=$(id),cur=e.value;e.innerHTML="";
-    // Le tracker camera ne peut pas servir d'axe d'objectif : la console le
-    // refuse de toute facon, autant ne pas le proposer.
-    const list = id==="sel-lens" && s.camera
-      ? s.devices.filter(d=>d.id!==s.camera) : s.devices;
-    list.forEach(d=>e.appendChild(el("option",null,d.id)));
-    if(cur && list.some(d=>d.id===cur)) e.value=cur}
 }
 
 function studio(s){
@@ -1672,6 +1833,8 @@ class Handler(BaseHTTPRequestHandler):
             h.studio_save()
         elif "set_camera" in q:
             h.set_camera(q["set_camera"])
+        elif "set_role" in q:
+            h.set_role(q["set_role"], q.get("device", ""))
         elif "sweep_start" in q:
             h.sweep_start(q["sweep_start"], q.get("device", ""))
         elif "sweep_stop" in q:
@@ -1705,15 +1868,16 @@ def selftest():
     l'axes.json reel et l'auto-test ne dirait plus la meme chose selon
     l'etat de calibration de la machine.
     """
-    global AXES_PATH, WORLD_PATH
-    saved = (AXES_PATH, WORLD_PATH)
+    global AXES_PATH, WORLD_PATH, ROLES_PATH
+    saved = (AXES_PATH, WORLD_PATH, ROLES_PATH)
     tmp = tempfile.mkdtemp(prefix="vp-console-selftest-")
     AXES_PATH = os.path.join(tmp, "axes.json")
     WORLD_PATH = os.path.join(tmp, "world.json")
+    ROLES_PATH = os.path.join(tmp, "roles.json")
     try:
         return _selftest_run()
     finally:
-        AXES_PATH, WORLD_PATH = saved
+        AXES_PATH, WORLD_PATH, ROLES_PATH = saved
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -1788,7 +1952,16 @@ def _selftest_run():
     assert hub.world, hub.msg
 
     # -- objectifs -------------------------------------------------------
-    hub.set_camera("DEMO-CAM")
+    hub.set_role("camera", "DEMO-CAM")
+    hub.set_role("zoom", "DEMO-ZOO")
+    hub.set_role("focus", "DEMO-FOC")
+    hub.set_role("survey", "DEMO-CTRL1")
+    assert hub.roles["camera"] == "DEMO-CAM", hub.roles
+    # Un appareil, un role : le second appel doit etre refuse.
+    hub.set_role("focus", "DEMO-ZOO")
+    assert hub.roles["focus"] == "DEMO-FOC", hub.roles
+    assert "role" in hub.msg, hub.msg
+    print("garde     : un appareil pour deux roles -> refuse")
     time.sleep(0.5)
     for name, dev in (("focus", "DEMO-FOC"), ("zoom", "DEMO-ZOO")):
         hub.sweep_start(name, dev)
@@ -1805,6 +1978,33 @@ def _selftest_run():
     hub.sweep_start("focus", "DEMO-CAM")
     assert hub.sweep is None, "la camera ne peut pas servir d'axe d'objectif"
     print("garde     : camera comme axe d'objectif -> refuse")
+
+    # REMPLACEMENT D'UN TRACKER. Reassigner un role a un autre appareil doit
+    # effacer la calibration qui en dependait : elle a ete relevee sur un
+    # autre montage et donnerait des valeurs plausibles et fausses.
+    assert set(hub.axes) == {"focus", "zoom"}
+    hub.set_role("focus", "DEMO-CTRL2")
+    assert "focus" not in hub.axes, hub.axes
+    assert "zoom" in hub.axes, "le zoom n'avait pas a bouger"
+    print("garde     : axe reassigne -> sa calibration est effacee")
+
+    # Remplacer la CAMERA fait tomber les deux axes : ils sont calibres en
+    # relatif camera (cal["ref"] = conj(q_cam) * q_objectif).
+    hub.set_role("focus", "DEMO-FOC")
+    hub.set_role("camera", "DEMO-CTRL3")
+    assert hub.axes == {}, hub.axes
+    print("garde     : camera remplacee -> les deux axes tombent")
+
+    # On remet l'etat pour la suite de l'enchainement.
+    hub.set_role("camera", "DEMO-CAM")
+    for name, dev in (("focus", "DEMO-FOC"), ("zoom", "DEMO-ZOO")):
+        hub.set_role(name, dev)
+        hub.sweep_start(name)
+        time.sleep(6.0)
+        hub.sweep_stop()
+        assert hub.sweep_result, hub.msg
+        hub.sweep_save()
+    assert set(hub.axes) == {"focus", "zoom"}
 
     # -- test -------------------------------------------------------------
     hub.test_arm()
