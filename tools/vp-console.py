@@ -138,6 +138,7 @@ class Hub:
         self.world = None
         self.world_report = None
         self.lighthouses = worldframe.read_lighthouses()
+        self._lh_mtime = None    # relecture quand libsurvive reecrit sa config
 
         # -- objectifs
         self.axes = {}
@@ -274,6 +275,30 @@ class Hub:
             if any(c.get("device") == dev for c in self.axes.values()):
                 self.outp.append((t, dev, quat))
 
+    def _refresh_lighthouses(self):
+        """Relit la geometrie des base stations quand libsurvive la reecrit.
+
+        Elle n'etait lue qu'au demarrage du Hub : sur une premiere mise sous
+        tension, libsurvive resout les stations APRES, et le compte restait
+        a zero jusqu'au prochain redemarrage de la console. On suit le mtime
+        du fichier plutot que de le relire a chaque tour.
+        """
+        if self.demo:
+            # La demo fabrique son propre plateau et injecte ses base
+            # stations : relire la config reelle les ecraserait, et
+            # l'auto-test se retrouverait a juger une geometrie qui n'est
+            # pas la sienne.
+            return
+        path = os.path.expanduser("~/.config/libsurvive/config.json")
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            return
+        if m == self._lh_mtime:
+            return
+        self._lh_mtime = m
+        self.lighthouses = worldframe.read_lighthouses(path)
+
     def _prepare_frame(self):
         """Repere plateau precalcule, refait quand world change d'identite.
 
@@ -290,6 +315,7 @@ class Hub:
         self._wf_key = self.world
 
     def _resolve(self, now):
+        self._refresh_lighthouses()
         self._prepare_frame()
         self._watchdog(now)
         if self.capture and now > self.capture[2]:
@@ -1538,7 +1564,13 @@ class Hub:
                 "min_rate": round(min([d["rate"] for d in watch],
                                       default=0.0), 1),
                 "drops": sum(d["drops"] for d in watch),
+                # Deux choses differentes, et les confondre trompe : la
+                # geometrie RESOLUE est memorisee dans la config libsurvive
+                # et survit a l'extinction des stations ; « vues » veut dire
+                # qu'un appareil recoit des balayages MAINTENANT.
                 "lh_seen": len(self.lighthouses or {}),
+                "lh_live": any(now - d["t"] < 1.0
+                               for d in self.dev.values()),
                 # Un axes.json produit en --demo reste sur le disque et sera
                 # relu au demarrage suivant, bridge compris. Le dire fort
                 # plutot que de laisser croire a une calibration reelle.
@@ -2374,8 +2406,12 @@ function health(s){
     +'</span>');
 
   // base stations lues dans la config libsurvive
-  c.push('<span class="chip'+(H.lh_seen>=2?'':' warn2')+'">'
-    +lamp(H.lh_seen>=2?ok:wr)+v(H.lh_seen,1)+' base stations</span>');
+  // « résolues » et « vues » ne disent pas la même chose : la géométrie
+  // est mémorisée et survit à l'extinction des stations.
+  const lhk=H.lh_seen>=2?(H.lh_live?ok:wr):bd;
+  c.push('<span class="chip'+(lhk===ok?'':(lhk===wr?' warn2':' alarm'))+'">'
+    +lamp(lhk)+v(H.lh_seen,1)+' base stations'
+    +(H.lh_seen>=2&&!H.lh_live?' <b>non vues</b>':'')+'</span>');
 
   // une calibration de demo sur le disque serait relue par le bridge
   if(H.demo_cal)
@@ -2836,6 +2872,26 @@ def _selftest_run():
         return False
 
     print("horloge   : %s" % hub.clock.describe())
+
+    # « resolues » et « vues » sont deux choses differentes : la geometrie est
+    # memorisee dans la config libsurvive et survit a l'extinction des
+    # stations. Le bandeau annoncait « 2 base stations » alors que plus rien
+    # n'emettait depuis cinq heures — exactement ce qui a trompe Patrice.
+    h = hub.snapshot()["health"]
+    assert h["lh_seen"] == 2, h
+    assert h["lh_live"] is True, h
+    with hub.lock:
+        keep = {k: v["t"] for k, v in hub.dev.items()}
+        for v in hub.dev.values():
+            v["t"] = time.monotonic() - 60.0
+    h = hub.snapshot()["health"]
+    assert h["lh_seen"] == 2, "la geometrie resolue doit rester memorisee"
+    assert h["lh_live"] is False, h
+    with hub.lock:
+        for k, t0 in keep.items():
+            if k in hub.dev:
+                hub.dev[k]["t"] = t0
+    print("garde     : base stations resolues mais NON VUES -> distinguees")
     assert hub.clock.scale is not None, "l'horloge aurait du se resoudre"
 
     # -- studio ---------------------------------------------------------
