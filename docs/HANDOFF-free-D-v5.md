@@ -525,15 +525,22 @@ appareils **en service** — ceux qui portent un rôle — et escalade seule :
 
 Le déclencheur est l'**USB**, pas l'absence de pose : réinitialiser un
 périphérique parce qu'une base station est éteinte n'aurait aucun sens.
-Trois cas distingués :
+Quatre cas distingués :
 
 | situation | action |
 |---|---|
 | absent de l'USB | câble, port ou alimentation — signalé, **aucune action** |
 | présent, muet, **personne** ne voit les stations | stations éteintes ou tous hors champ — signalé, **aucune action** |
-| présent, muet, mais **d'autres** produisent des poses | le tracker est **sourd** : c'est le seul cas réparable |
+| présent, muet, mais il **a déjà produit des poses** | **masqué ou hors champ** — signalé, **aucune action** : il reviendra seul |
+| présent, muet, et il n'a **jamais** produit de pose | tracker **bloqué** : le seul cas réparable |
 
-Dans ce dernier cas seulement, l'escalade :
+Le troisième est le cas du **tournage**. Un tracker caché derrière un sujet
+le temps d'un plan a déjà fonctionné : le réinitialiser le ferait
+ré-énumérer, et libsurvive le perdrait — alors qu'il serait revenu seul. Il
+reprend sa fonction dès qu'il revoit une station, sans rien faire : le rôle
+est lié à son numéro de série, pas à sa présence.
+
+Dans le quatrième cas seulement, l'escalade :
 
 | muet depuis | action |
 |---|---|

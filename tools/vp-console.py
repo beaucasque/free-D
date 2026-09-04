@@ -183,6 +183,11 @@ class Hub:
         self.wd_log = []         # dernieres actions, pour l'interface
         self.wd_state = {}       # par serie : depuis quand muet, quoi tente
         self.wd_last = 0.0
+        # Series ayant produit AU MOINS UNE pose depuis le demarrage. C'est
+        # ce qui distingue une occlusion — l'appareil a deja fonctionne,
+        # il reviendra seul — d'un tracker bloque, qui n'a jamais rien
+        # donne et que seule une reinitialisation reveille.
+        self.ever_seen = set()
         self.preset_emit = None  # cible Unreal rappelee par un preset
         self._pc = {}            # cache des presets lus, cle = (nom, mtime)
 
@@ -256,6 +261,8 @@ class Hub:
             d["ts"].append(t)
             d.update(pos=pos, quat=quat, t=t)
             d["n"] += 1
+
+            self.ever_seen.add(dev)
 
             if dev == self.camera:
                 self.hist.push(t, quat, pos)
@@ -707,7 +714,10 @@ class Hub:
 
             if age is not None and age < self.WD_STALE:
                 if st["since"] is not None:
-                    self._wd_say("%s repond de nouveau." % serial)
+                    role = next((r for r, v in self.roles.items()
+                                 if v == serial), "?")
+                    self._wd_say("%s revient en ligne — role %s repris."
+                                 % (serial, role))
                 st.update(since=None, did=None, n=0)
                 continue
 
@@ -735,8 +745,22 @@ class Hub:
                                  "reinitialiser.")
                 continue
 
-            # Cas 2 : USB bon, stations vues par d'autres, celui-ci est
-            # SOURD. C'est le seul cas qu'un reset repare.
+            if serial in self.ever_seen:
+                # Cas 4 : il a DEJA produit des poses, donc il n'est ni
+                # debranche ni bloque — il est masque, ou sorti du volume.
+                # Rien a reinitialiser : reinitialiser un tracker cache en
+                # plein tournage le ferait re-enumerer et libsurvive le
+                # perdrait, alors qu'il serait revenu seul. On attend.
+                if st["did"] != "occl":
+                    st["did"] = "occl"
+                    self._wd_say("%s masque ou hors champ. Il reprendra son "
+                                 "role des qu'il reverra une station — rien "
+                                 "a faire." % serial)
+                continue
+
+            # Cas 2 : USB bon, stations vues par d'autres, et il n'a JAMAIS
+            # rien donne depuis le demarrage. Celui-la est bloque, et c'est
+            # le seul cas qu'un reset repare.
             if st["did"] in ("usb", "lh"):
                 st["did"] = None      # la cause a change
 
@@ -745,8 +769,8 @@ class Hub:
                 self._wd_abort("appareil muet pendant un relevé")
                 err = usbreset.reset([serial]).get(serial)
                 st.update(did="reset", reset_at=now, n=st["n"] + 1)
-                self._wd_say("%s sourd alors que l'USB et les stations vont "
-                             "bien : reinitialisation%s"
+                self._wd_say("%s n'a jamais produit de pose alors que l'USB "
+                             "et les stations vont bien : reinitialisation%s"
                              % (serial, "" if err is None
                                 else " ECHOUEE : " + err))
 
@@ -3140,9 +3164,28 @@ def _selftest_run():
         assert not resets, "reset premature a 4 s"
         print("garde     : muet 4 s -> signale, aucune action")
 
+        # OCCLUSION : il a deja produit des poses, donc il reviendra seul.
+        # Le reinitialiser en plein tournage le ferait re-enumerer et
+        # libsurvive le perdrait. C'est le cas le plus important.
+        tick(12.0); tick(30.0); tick(120.0)
+        assert not resets, "un tracker masque a ete reinitialise : %s" % resets
+        assert any("masque" in m for _t, m in hub.wd_log), hub.wd_log
+        print("garde     : tracker MASQUE -> aucune action, il reviendra seul")
+
+        # ... et il reprend sa fonction des son retour.
+        hub.wd_log.clear()
+        tick(0.0)
+        assert any("revient en ligne" in m and "camera" in m
+                   for _t, m in hub.wd_log), hub.wd_log
+        print("garde     : retour -> role repris, et annonce")
+
+        # BLOQUE : jamais produit une seule pose depuis le demarrage.
+        resets.clear(); hub.wd_state.clear(); hub.wd_log.clear()
+        hub.ever_seen.discard(cam)
         tick(12.0)
         assert resets == [[cam]], resets
-        print("garde     : sourd, USB et stations bonnes -> reinitialise")
+        print("garde     : jamais vu depuis le demarrage -> reinitialise")
+        hub.ever_seen.add(cam)
 
         # ABSENT DE L'USB : rien a reinitialiser.
         resets.clear(); hub.wd_state.clear(); hub.wd_log.clear()
@@ -3181,6 +3224,7 @@ def _selftest_run():
 
         # Trois tentatives sans effet : abandon, pas de boucle nocturne.
         resets.clear(); hub.wd_log.clear(); hub.wd_state.clear()
+        hub.ever_seen.discard(cam)
         for _ in range(10):
             st = hub.wd_state.get(cam)
             if st and st.get("did") == "reset" and st.get("n", 0) < hub.WD_TRIES:
@@ -3191,6 +3235,7 @@ def _selftest_run():
         assert any("abandon" in m for _t, m in hub.wd_log), hub.wd_log
         print("garde     : 3 tentatives sans effet -> abandon")
 
+        hub.ever_seen.add(cam)
         hub.wd_state.clear()
         with hub.lock:
             hub.dev[cam]["t"] = time.monotonic()
