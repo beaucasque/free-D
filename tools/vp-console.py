@@ -181,6 +181,8 @@ class Hub:
         self.wd_log = []         # dernieres actions, pour l'interface
         self.wd_state = {}       # par serie : depuis quand muet, quoi tente
         self.wd_last = 0.0
+        self.preset_emit = None  # cible Unreal rappelee par un preset
+        self._pc = {}            # cache des presets lus, cle = (nom, mtime)
 
         # Roles attribues a la main, une fois pour toutes, avant toute
         # calibration. Ils portent des NUMEROS DE SERIE : le §8 interdit de
@@ -704,6 +706,186 @@ class Hub:
             self.sweep_result = None
             self._wd_say("Balayage %s abandonne : %s." % (name, why))
 
+    # -- guide -------------------------------------------------------------
+
+    def _preset_blobs(self):
+        """Contenu des presets, relu seulement quand un fichier change.
+
+        guide() tourne a chaque instantane, soit 20 fois par seconde : relire
+        et decoder les presets a ce rythme serait du gaspillage pur.
+        """
+        out = []
+        try:
+            names = [x for x in os.listdir(PRESETS) if x.endswith(".json")]
+        except OSError:
+            self._pc.clear()
+            return out
+        for n in names:
+            path = os.path.join(PRESETS, n)
+            try:
+                key = (n, os.path.getmtime(path))
+            except OSError:
+                continue
+            if key not in self._pc:
+                try:
+                    with open(path) as f:
+                        self._pc = {k: v for k, v in self._pc.items()
+                                    if k[0] != n}
+                        self._pc[key] = json.load(f)
+                except (OSError, ValueError):
+                    continue
+            out.append(self._pc[key])
+        return out
+
+    def _is_saved(self, what):
+        """Cette partie de la configuration figure-t-elle dans un preset ?
+
+        Trois etats valent mieux que deux : « fait » et « fait ET enregistre »
+        ne disent pas la meme chose — le premier se perd au prochain
+        changement de configuration, le second non.
+        """
+        blobs = self._preset_blobs()
+        if not blobs:
+            return False
+        if what == "roles":
+            cur = {k: v for k, v in self.roles.items() if v}
+            return any({k: v for k, v in (b.get("roles") or {}).items() if v}
+                       == cur for b in blobs) and bool(cur)
+        if what == "world":
+            return bool(self.world) and any(b.get("world") == self.world
+                                            for b in blobs)
+        if what == "emit":
+            if not self.emit_to:
+                return False
+            cur = {"host": self.emit_to[0], "port": self.emit_to[1]}
+            return any(b.get("emit") == cur for b in blobs)
+        if what in ("zoom", "focus"):
+            cal = self.axes.get(what)
+            return bool(cal) and any((b.get("axes") or {}).get(what) == cal
+                                     for b in blobs)
+        return False
+
+    def guide(self):
+        """Les etapes, dans l'ordre, avec leur etat REEL.
+
+        Calcule ici et non dans le navigateur : c'est ainsi verifiable par le
+        --selftest. Chaque etape porte ce qu'il faut FAIRE physiquement et
+        pourquoi — un nouvel utilisateur ne doit pas avoir a lire le handoff
+        pour savoir dans quel ordre s'y prendre.
+
+        L'APPELANT DOIT TENIR self.lock. threading.Lock n'est pas reentrant :
+        le reprendre ici depuis snapshot(), qui le tient deja, bloquerait la
+        console pour de bon.
+        """
+        if True:
+            seen = {d for d, v in self.dev.items()
+                    if time.monotonic() - v["t"] < 1.0}
+            roles = dict(self.roles)
+            served = [r for r, _l in ROLES if roles.get(r)]
+            missing = [r for r, _l in ROLES if not roles.get(r)]
+            axes_ok = [n for n in ("zoom", "focus") if n in self.axes]
+            rolls = (self.results or {}).get("roulis", {}).get("axes", {})
+            roll_ok = bool(rolls) and all(v["pct"] < 1.0 for v in rolls.values())
+
+            def step(key, title, done, todo, why, tab, blocked=None,
+                     saves=None):
+                # « enregistre » n'a de sens que pour ce qu'un preset porte :
+                # un resultat de test n'est pas une configuration.
+                sv = bool(saves) and done and self._is_saved(saves)
+                return {"key": key, "title": title, "tab": tab,
+                        "state": ("bloque" if blocked else
+                                  "enregistre" if sv else
+                                  "fait" if done else "a-faire"),
+                        "savable": bool(saves),
+                        "todo": blocked or todo, "why": why}
+
+            g = []
+            g.append(step(
+                "devices", "Brancher et identifier les appareils",
+                len(seen) >= 4,
+                "Branche les trackers sur le hub multi-TT. Bouge-en un : la "
+                "colonne des mètres t'indique lequel c'est. %d appareil(s) "
+                "actif(s)." % len(seen),
+                "L'identifiant est le numéro de série gravé, pas le nom T2x "
+                "de libsurvive, qui se décale dès qu'on branche un appareil "
+                "de plus.", "dev"))
+
+            g.append(step(
+                "roles", "Attribuer les quatre fonctions",
+                not missing,
+                "Il manque : %s." % ", ".join(missing) if missing
+                else "Les quatre sont attribuées.",
+                "Rien d'autre ne fonctionne avant : le relevé et le balayage "
+                "prennent leur appareil dans ces rôles. Un appareil ne peut "
+                "en tenir qu'un.", "dev",
+                blocked=None if len(seen) >= 1 else
+                "Aucun appareil vu — commence par l'étape 1.",
+                saves="roles"))
+
+            g.append(step(
+                "world", "Relever le plateau — trois points au sol",
+                bool(self.world),
+                "Pose l'appareil de relevé au coin bas GAUCHE de l'écran, "
+                "relève ; puis au coin bas DROIT ; puis au sol SOUS la "
+                "caméra. À plat, même orientation aux trois. Puis Résoudre.",
+                "Trois points non alignés déterminent le plan entièrement. "
+                "Deux laisseraient libre le roulis du sol, donc "
+                "l'inclinaison de l'horizon virtuel. C'est ce relevé qui "
+                "donne à Unreal l'origine et l'orientation de ton studio.",
+                "studio",
+                blocked=None if roles.get("survey") else
+                "Attribue d'abord le rôle « relevé » (étape 2).",
+                saves="world"))
+
+            for axis, ring in (("zoom", "zoom"), ("focus", "mise au point")):
+                g.append(step(
+                    "axis-" + axis, "Calibrer l'axe %s" % axis,
+                    axis in self.axes,
+                    "Caméra IMMOBILE sur trépied. Choisis « %s », démarre, "
+                    "tourne la bague de %s butée à butée lentement, arrête, "
+                    "enregistre." % (axis, ring),
+                    "Le balayage déduit l'axe de rotation du pignon par SVD, "
+                    "sans aucune mesure mécanique, et la référence est prise "
+                    "EN RELATIF CAMÉRA — c'est ce qui élimine le mouvement "
+                    "de la caméra du zoom et du focus.", "axes",
+                    blocked=None if roles.get("camera") and roles.get(axis)
+                    else "Attribue d'abord les rôles caméra et %s." % axis,
+                    saves=axis))
+
+            g.append(step(
+                "test", "Vérifier le découplage — phase roulis",
+                roll_ok,
+                "Bloque les bagues au ruban. Arme, fais « repos » sans "
+                "toucher à rien, puis « roulis » : vrille la caméra autour "
+                "de son axe optique.",
+                "Le roulis est la seule phase qui juge : l'axe des pignons "
+                "lui est colinéaire. La trace ambre doit décoller et la "
+                "cyan rester plate. Sous 0,3 % de la course, c'est bon.",
+                "test",
+                blocked=None if len(axes_ok) == 2 else
+                "Calibre d'abord les deux axes."))
+
+            g.append(step(
+                "emit", "Émettre vers Unreal",
+                self.sender is not None,
+                "Onglet Sortie : hôte et port d'Unreal (40000 par défaut), "
+                "puis Émettre. Vérifie que « Ce qui manque » est vide.",
+                "Les valeurs affichées sont décodées depuis les octets "
+                "réellement encodés : ce que tu lis est ce qui part sur le "
+                "câble.", "out",
+                blocked=None if self.world and len(axes_ok) == 2 else
+                "Il faut le repère et les deux axes.",
+                saves="emit"))
+
+            g.append(step(
+                "preset", "Enregistrer le preset",
+                bool(self.presets()),
+                "Onglet Appareils : donne un nom et enregistre.",
+                "Il regroupe rôles, repère et axes. C'est ce qui rappellera "
+                "ton studio d'un coup, sans refaire trois calibrations.",
+                "dev"))
+            return g
+
     # -- presets -----------------------------------------------------------
 
     def presets(self):
@@ -738,10 +920,16 @@ class Hub:
                 self.msg = "Preset : %s" % e
                 return
             data = {
+                "schema": 1,
                 "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "roles": dict(self.roles),
                 "world": self.world,
                 "axes": self.axes,
+                # La cible Unreal fait partie du studio : la rappeler evite
+                # de la retaper, et evite surtout d'emettre par erreur vers
+                # l'ancienne machine.
+                "emit": {"host": self.emit_to[0], "port": self.emit_to[1]}
+                        if self.emit_to else None,
             }
             try:
                 os.makedirs(PRESETS, exist_ok=True)
@@ -776,6 +964,7 @@ class Hub:
             self.hist = lensaxis.CameraHistory(span=2.0)
             self.world = d.get("world") or None
             self.axes = d.get("axes") or {}
+            self.preset_emit = d.get("emit") or None
 
             # Tout ce qui derivait de l'ancienne configuration est caduc.
             self.outs.clear()
@@ -794,9 +983,15 @@ class Hub:
             except OSError as e:
                 self.msg = "Preset charge, mais non ecrit sur disque : %s" % e
                 return
-            self.msg = ("Preset « %s » charge : %d role(s), repere %s, %d axe(s)."
+            extra = ""
+            if self.preset_emit:
+                extra = " · cible %s:%d" % (self.preset_emit["host"],
+                                            self.preset_emit["port"])
+            self.msg = ("Preset « %s » charge : %d role(s), repere %s, "
+                        "%d axe(s)%s."
                         % (safe, len(self.roles),
-                           "oui" if self.world else "non", len(self.axes)))
+                           "oui" if self.world else "non", len(self.axes),
+                           extra))
 
     def preset_delete(self, name):
         with self.lock:
@@ -1120,6 +1315,8 @@ class Hub:
             out["results"] = self.results
             out["roles"] = dict(self.roles)
             out["presets"] = self.presets()
+            out["guide"] = self.guide()   # sous verrou, voir guide()
+            out["preset_emit"] = self.preset_emit
             out["wd"] = {
                 "on": self.wd_on,
                 "log": [{"t": t, "m": m} for t, m in self.wd_log],
@@ -1346,6 +1543,27 @@ ol.ph b{font-weight:500;display:block}
    large, soit un mot par ligne. On le force en colonne 2. */
 ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
  line-height:1.35}
+ol.gd{list-style:none;margin:0;padding:0;counter-reset:g}
+ol.gd li{counter-increment:g;display:grid;grid-template-columns:26px 1fr;
+ gap:10px;padding:11px 8px;border-bottom:1px solid var(--rule);cursor:pointer}
+ol.gd li:hover{background:#2a2f38}
+ol.gd li::before{content:counter(g);color:var(--dim);font-size:12px;
+ font-family:"Ubuntu Mono",monospace;text-align:right}
+/* Trois etats visuels, pas deux. « fait » en ambre dit que la valeur
+   existe mais n'est dans AUCUN preset : elle se perdra au prochain
+   changement. « enregistre » en vert dit qu'elle est a l'abri. */
+ol.gd li.fait::before{content:"●";color:var(--warn)}
+ol.gd li.fait{border-left:3px solid var(--warn)}
+ol.gd li.enregistre::before{content:"✓";color:var(--ok)}
+ol.gd li.enregistre{border-left:3px solid var(--ok)}
+ol.gd li.a-faire{border-left:3px solid var(--aligne)}
+ol.gd li.bloque{opacity:.5;cursor:default}
+ol.gd li.bloque::before{content:"·";color:var(--dim)}
+ol.gd li.a-faire{background:#2d3a42;outline:1px solid var(--aligne)}
+ol.gd b{grid-column:2;font-weight:500;display:block;margin-bottom:3px}
+ol.gd .todo{grid-column:2;font-size:12.5px;line-height:1.4}
+ol.gd .why{grid-column:2;font-size:11.5px;line-height:1.35;color:var(--dim);
+ margin-top:5px}
 .hb{display:flex;align-items:center;gap:14px;flex-wrap:wrap;
   padding:7px 16px;border-bottom:1px solid var(--rule);
   background:var(--panel2);font-size:12px;
@@ -1372,7 +1590,8 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
 
 <header>
   <h1>Console Free-D</h1>
-  <div class="tab on" data-t="dev">Appareils<span class="chk" id="c-dev"></span></div>
+  <div class="tab on" data-t="guide">Guide<span class="chk" id="c-guide"></span></div>
+  <div class="tab" data-t="dev">Appareils<span class="chk" id="c-dev"></span></div>
   <div class="tab" data-t="studio">Studio<span class="chk" id="c-studio"></span></div>
   <div class="tab" data-t="axes">Objectifs<span class="chk" id="c-axes"></span></div>
   <div class="tab" data-t="test">Test<span class="chk" id="c-test"></span></div>
@@ -1386,7 +1605,30 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
 
 <main>
 <!-- ------------------------------------------------- APPAREILS -->
-<div class="pane on" id="p-dev"><div class="grid">
+<!-- ------------------------------------------------- GUIDE -->
+<div class="pane on" id="p-guide"><div class="grid">
+  <div>
+    <div class="card"><h3>Où en es-tu</h3>
+      <div id="gprog" class="note"></div>
+      <p class="note">Chaque étape se déverrouille quand la précédente est
+      faite. Clique une étape pour aller à son onglet.</p>
+      <div class="note" style="margin-top:12px;line-height:1.9">
+        <span style="color:var(--aligne)">▌</span> à faire<br>
+        <span style="color:var(--warn)">▌</span> fait, mais <b>dans aucun
+        preset</b> — se perdra au prochain changement<br>
+        <span style="color:var(--ok)">▌</span> fait et enregistré<br>
+        <span class="dim">▌ bloqué : une étape précédente manque</span>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="card"><h3>Étapes</h3>
+      <ol class="gd" id="gsteps"></ol>
+    </div>
+  </div>
+</div></div>
+
+<div class="pane" id="p-dev"><div class="grid">
   <div>
     <div class="card"><h3>Appareils vus</h3>
       <table><tbody id="devs"></tbody></table>
@@ -1626,7 +1868,37 @@ ev.onmessage=e=>{const s=JSON.parse(e.data);last=s;
   $("hdr").style.color=s.clock_ok?"var(--dim)":"var(--warn)";
   $("c-out").textContent=(s.emit&&s.emit.on)?"✓":"";
   $("c-dev").textContent=(s.role_defs||[]).every(([k])=>s.roles&&s.roles[k])?"✓":"";
-  health(s);roles(s);devices(s);studio(s);axes(s);test(s);outp(s)};
+  health(s);guide(s);roles(s);devices(s);studio(s);axes(s);test(s);outp(s)};
+
+// Le guide. L'etat vient du serveur, pas d'une deduction ici : il est ainsi
+// couvert par le --selftest. On ne fait que l'afficher.
+function guide(s){
+  const G=s.guide||[],host=$("gsteps");
+  if(!host)return;
+  const done=G.filter(g=>g.state==="fait").length;
+  $("c-guide").textContent=(done===G.length&&G.length)?"✓":"";
+  const pg=$("gprog");
+  if(pg){
+    const next=G.find(g=>g.state==="a-faire");
+    pg.innerHTML='<div class="big">'+done+' / '+G.length+'</div>'
+      +(next?'<div style="margin-top:6px">Prochaine étape : <b>'
+             +next.title+'</b></div>'
+            :'<div style="margin-top:6px;color:var(--ok)">Tout est fait.</div>');
+  }
+  const sig=G.map(g=>g.key+g.state+g.todo).join("|");
+  if(host.dataset.sig===sig)return;
+  host.dataset.sig=sig;
+  host.innerHTML="";
+  for(const g of G){
+    const li=el("li",g.state);
+    li.appendChild(el("b",null,g.title));
+    li.appendChild(el("div","todo",g.todo));
+    li.appendChild(el("div","why",g.why));
+    if(g.state!=="bloque")
+      li.onclick=()=>document.querySelector('.tab[data-t="'+g.tab+'"]').click();
+    host.appendChild(li);
+  }
+}
 
 // Attribution des roles. Un menu par role, alimente par les appareils vus.
 // Un appareil deja pris est signale, et le serveur refuse : un appareil, un
@@ -2404,8 +2676,32 @@ def _selftest_run():
         assert os.sep not in safe, safe
     print("garde     : nom de preset hors repertoire -> refuse")
 
+    # Le guide et ses TROIS etats. Un code couleur dont on n'a jamais vu la
+    # troisieme valeur ne vaut rien : on la provoque.
+    def gstate(key):
+        return next(g["state"] for g in hub.guide() if g["key"] == key)
+
+    assert gstate("roles") == "enregistre", gstate("roles")
+    assert gstate("world") == "enregistre", gstate("world")
+    assert gstate("axis-zoom") == "enregistre", gstate("axis-zoom")
+    print("guide     : fait ET enregistre -> vert")
+
+    # On change la configuration sans resauvegarder : elle n'est plus dans
+    # aucun preset, donc « fait » et non « enregistre ».
+    hub.set_role("survey", "DEMO-SURV2")
+    assert gstate("roles") == "fait", gstate("roles")
+    print("guide     : fait mais hors preset -> ambre")
+
+    # Une etape dont le prealable manque est bloquee, pas « a faire ».
+    saved_axes, hub.axes = hub.axes, {}
+    assert gstate("test") == "bloque", gstate("test")
+    hub.axes = saved_axes
+    print("guide     : prealable manquant -> bloque")
+
+    hub.preset_load("essai")          # on remet l'etat du preset
     hub.preset_delete("essai")
     assert "essai" not in hub.presets(), hub.presets()
+    assert gstate("roles") == "fait", "sans preset, plus rien n'est enregistre"
     print("preset    : suppression")
 
     # -- chien de garde ---------------------------------------------------

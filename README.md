@@ -103,8 +103,9 @@ bridge/      la chaîne temps réel
   roles.json         quelle fonction pour quel n° de série (produit par la console)
   presets/           configurations de studio nommées (rôles + repère + axes)
 tools/       calibration et diagnostic
-  vp-console.py      serveur web, 5 onglets — Appareils, Studio, Objectifs,
-                     Test, Sortie ; bandeau de santé permanent
+  vp-console.py      serveur web, 6 onglets — Guide, Appareils, Studio,
+                     Objectifs, Test, Sortie ; bandeau de santé permanent,
+                     surveillance et récupération automatiques
   calib-world.py     équivalent CLI de l'onglet Studio
   calib-axis.py      équivalent CLI de l'onglet Objectifs
   test-decouple.py   équivalent CLI de l'onglet Test

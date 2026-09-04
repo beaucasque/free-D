@@ -312,6 +312,26 @@ commande — une moyenne cacherait celui qui gâte la mesure.
 
 Cinq onglets, dans l'ordre où on s'en sert.
 
+### Onglet Guide
+
+Le premier onglet, et il suffit à mener quelqu'un qui découvre le système :
+les étapes dans l'ordre, avec ce qu'il faut **faire physiquement** et
+**pourquoi**. Une étape se déverrouille quand son prérequis est rempli, et
+cliquer dessus mène à l'onglet concerné.
+
+L'état est calculé côté serveur, pas déduit dans le navigateur : il est donc
+couvert par le `--selftest`. Quatre états, à trois couleurs :
+
+| | |
+|---|---|
+| cyan | à faire — c'est la prochaine |
+| ambre | fait, mais **dans aucun preset** : se perdra au prochain changement |
+| vert | fait et enregistré |
+| gris | bloqué : une étape précédente manque |
+
+L'ambre est le plus utile des trois : il distingue une calibration obtenue
+d'une calibration **conservée**.
+
 ### Onglet Appareils
 
 Le premier, et il conditionne tout le reste. La liste montre chaque appareil
