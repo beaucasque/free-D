@@ -972,9 +972,12 @@ class Hub:
 
             def step(key, title, done, todo, why, tab, blocked=None,
                      saves=None):
-                # « enregistre » n'a de sens que pour ce qu'un preset porte :
-                # un resultat de test n'est pas une configuration.
-                sv = bool(saves) and done and self._is_saved(saves)
+                # L'ambre veut dire « fait mais dans AUCUN preset ». Elle
+                # n'a de sens que pour ce qu'un preset PORTE : un resultat de
+                # test n'est pas une configuration, et l'etape « enregistrer
+                # le preset » ne peut evidemment pas s'y trouver elle-meme.
+                # Ces etapes-la sont vertes des qu'elles sont faites.
+                sv = done and (not saves or self._is_saved(saves))
                 return {"key": key, "title": title, "tab": tab,
                         "state": ("bloque" if blocked else
                                   "enregistre" if sv else
@@ -996,13 +999,15 @@ class Hub:
             g.append(step(
                 "roles", "Attribuer les quatre fonctions",
                 not missing,
-                "Il manque : %s." % ", ".join(missing) if missing
-                else "Les quatre sont attribuées.",
+                ("Il manque : %s." % ", ".join(missing) if missing
+                 else "Les quatre sont attribuées."),
                 "Rien d'autre ne fonctionne avant : le relevé et le balayage "
                 "prennent leur appareil dans ces rôles. Un appareil ne peut "
                 "en tenir qu'un.", "dev",
                 blocked=None if len(seen) >= 1 else
-                "Aucun appareil vu — commence par l'étape 1.",
+                ("Aucun appareil vu — commence par l'étape 1."
+                 + (" (%d rôle(s) déjà attribué(s) : %s)"
+                    % (len(served), ", ".join(served)) if served else "")),
                 saves="roles"))
 
             g.append(step(
@@ -3026,6 +3031,14 @@ def _selftest_run():
     assert gstate("test") == "bloque", gstate("test")
     hub.axes = saved_axes
     print("guide     : prealable manquant -> bloque")
+
+    # Une etape qu'un preset ne PORTE pas ne peut pas etre « hors preset » :
+    # l'ambre y serait absurde — l'etape « enregistrer le preset » ne peut
+    # pas se trouver dans un preset. Elle est verte des qu'elle est faite.
+    st = next(g for g in hub.guide() if g["key"] == "preset")
+    assert not st["savable"], st
+    assert st["state"] == "enregistre", st
+    print("guide     : etape non enregistrable -> verte des qu'elle est faite")
 
     hub.preset_load("essai")          # on remet l'etat du preset
     hub.preset_delete("essai")
