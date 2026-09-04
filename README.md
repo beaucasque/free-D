@@ -107,6 +107,7 @@ tools/       calibration et diagnostic
   calib-world.py     équivalent CLI de l'onglet Studio
   calib-axis.py      équivalent CLI de l'onglet Objectifs
   test-decouple.py   équivalent CLI de l'onglet Test
+  reset-trackers.py  réinitialise les trackers sans sudo ni redémarrage
 system/      vp-bridge.service, vp-console.service — supervisés, exclusifs l'un de l'autre
 patches/     correctifs appliqués à libsurvive avant compilation (voir patches/README.md)
 install.sh   mise à niveau d'une station : paquets, venv, libsurvive, udev, services

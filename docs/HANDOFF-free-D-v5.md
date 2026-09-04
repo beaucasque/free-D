@@ -419,6 +419,28 @@ module — c'est ce que fait `survive_clock.object_names()`, sur lequel la
 console et le bridge s'appuient tous les deux. Préfixes : `LHR-` pour un
 tracker, `LHB-` pour une base station.
 
+**Un tracker peut rester sourd aux base stations.** Constaté le 3 septembre
+2026 : trois trackers ouverts par libsurvive, firmware lu, mais aucune ligne
+`LightcapMode` et jamais une pose — pendant qu'un quatrième, au même endroit,
+voyait parfaitement les deux stations. Ce n'était ni l'orientation, ni
+l'USB : un état bloqué des trackers.
+
+Le remède ne demande ni de débrancher, ni de redémarrer la station :
+
+```bash
+systemctl --user stop vp-console
+tools/reset-trackers.py
+systemctl --user start vp-console
+```
+
+Les trois sont revenus à 238–244 Hz. L'outil émet un `USBDEVFS_RESET`, soit
+l'équivalent exact d'un débranchement/rebranchement, et fonctionne **sans
+sudo** parce que `81-vive.rules` met ces nœuds en `MODE 0666`.
+
+Le diagnostic tient en une ligne : si le journal montre `Adding tracked
+object` sans jamais de `LightcapMode`, le tracker est ouvert mais n'écoute
+pas. Réinitialiser avant de chercher ailleurs.
+
 **Ne pas extrapoler la pose caméra.** Un échantillon objectif plus récent que
 tout l'historique caméra est **différé d'un tick** (purge à 200 ms).
 L'accepter en extrapolant revient exactement au comportement naïf.
