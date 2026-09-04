@@ -67,6 +67,7 @@ AXES_PATH = os.path.join(BRIDGE, "axes.json")
 WORLD_PATH = os.path.join(BRIDGE, "world.json")
 ROLES_PATH = os.path.join(BRIDGE, "roles.json")
 PRESETS = os.path.join(BRIDGE, "presets")
+LENS_PATH = os.path.join(BRIDGE, "lens.json")
 
 ROLES = [
     ("camera", "Tracker CAMÉRA — sur la cage"),
@@ -183,6 +184,14 @@ class Hub:
         self.wd_last = 0.0
         self.preset_emit = None  # cible Unreal rappelee par un preset
         self._pc = {}            # cache des presets lus, cle = (nom, mtime)
+
+        # -- table objectif <-> reel ---------------------------------------
+        # Le Free-D transporte des COMPTES 0-65535, pas des metres ni des
+        # millimetres. Unreal a besoin de la correspondance pour que la
+        # profondeur de champ virtuelle colle au reel : c'est son LensFile,
+        # et c'est a nous de relever la table.
+        self.lens = {"focus": [], "zoom": [], "nodal": []}
+        self._load_lens()
 
         # Roles attribues a la main, une fois pour toutes, avant toute
         # calibration. Ils portent des NUMEROS DE SERIE : le §8 interdit de
@@ -619,6 +628,7 @@ class Hub:
     WD_RESET = 10.0       # muet au-dela : reinitialisation USB
     WD_GIVEUP = 40.0      # muet au-dela malgre le reset : re-enumeration
     WD_COOLDOWN = 30.0    # delai minimal entre deux resets du meme appareil
+    WD_TRIES = 3          # au-dela, on abandonne plutot que de boucler
 
     def _wd_say(self, msg):
         self.wd_log.insert(0, (time.strftime("%H:%M:%S"), msg))
@@ -626,15 +636,25 @@ class Hub:
         self.msg = msg
 
     def _watchdog(self, now):
-        """Surveille les appareils EN SERVICE et tente de les recuperer.
+        """Surveille les appareils EN SERVICE et distingue la CAUSE.
 
-        Seuls les appareils portant un role sont surveilles : un tracker de
-        rechange pose sur l'etabli n'a pas a declencher quoi que ce soit.
+        Le declencheur est l'USB, pas l'absence de pose. Reinitialiser un
+        peripherique parce qu'une base station est eteinte n'a aucun sens :
+        c'est traiter un symptome sans regarder sa cause. Trois cas :
 
-        Ce qui est recuperable ici : un tracker ouvert mais sourd (aucune
-        pose alors que libsurvive l'a bien ouvert) et une enumeration
-        manquee. Ce qui ne l'est PAS : une occlusion optique — on la
-        signale, on n'y peut rien.
+        1. Absent de l'USB — cable, port, alimentation. Rien a
+           reinitialiser : on le dit, on n'agit pas.
+        2. Present sur l'USB, muet, mais D'AUTRES appareils produisent des
+           poses : les stations emettent donc, et celui-ci est SOURD. Seul
+           cas qu'un reset repare, et seul cas ou on agit.
+        3. Present sur l'USB, muet, et PERSONNE ne produit de pose : base
+           stations eteintes, ou tout le monde hors champ. Rien a reparer.
+
+        Une occlusion optique n'est jamais reparable par logiciel : on la
+        signale et on constate le retour.
+
+        Seuls les appareils portant un role sont surveilles — un tracker de
+        rechange sur l'etabli ne declenche rien.
         """
         if not self.wd_on or now - self.wd_last < 1.0:
             return
@@ -645,6 +665,14 @@ class Hub:
             self.wd_state.clear()
             return
 
+        try:
+            on_usb = {ser for ser, _sys, _node in usbreset.valve_devices()}
+        except Exception:                                 # noqa: BLE001
+            on_usb = None          # illisible : on ne conclut rien
+
+        # Quelqu'un voit-il les base stations en ce moment ?
+        lh_up = any(now - d["t"] < self.WD_STALE for d in self.dev.values())
+
         for serial in served:
             d = self.dev.get(serial)
             age = (now - d["t"]) if d else None
@@ -654,40 +682,61 @@ class Hub:
             if age is not None and age < self.WD_STALE:
                 if st["since"] is not None:
                     self._wd_say("%s repond de nouveau." % serial)
-                st.update(since=None, did=None)
+                st.update(since=None, did=None, n=0)
                 continue
 
-            # Muet. « Depuis quand » se mesure sur la DERNIERE POSE, pas
-            # sur l'instant ou la surveillance l'a remarque : un appareil
-            # deja muet depuis dix minutes quand on demarre ne doit pas
-            # attendre dix secondes de plus. On ne retombe sur l'instant de
-            # detection que pour un appareil jamais vu, qui n'a pas d'age.
+            present = (on_usb is None) or (serial in on_usb)
             if st["since"] is None:
                 st["since"] = now
                 self._wd_say("%s ne repond plus." % serial)
             mute = age if age is not None else (now - st["since"])
 
+            if not present:
+                # Cas 1 : rien a reinitialiser, l'appareil n'est plus la.
+                if st["did"] != "usb":
+                    st["did"] = "usb"
+                    self._wd_say("%s absent de l'USB : cable, port ou "
+                                 "alimentation. Aucune action possible."
+                                 % serial)
+                continue
+
+            if not lh_up:
+                # Cas 3 : personne ne voit rien. Ce n'est pas cet appareil.
+                if st["did"] != "lh":
+                    st["did"] = "lh"
+                    self._wd_say("Aucun appareil ne voit les base stations : "
+                                 "eteintes, ou tous hors champ. Rien a "
+                                 "reinitialiser.")
+                continue
+
+            # Cas 2 : USB bon, stations vues par d'autres, celui-ci est
+            # SOURD. C'est le seul cas qu'un reset repare.
+            if st["did"] in ("usb", "lh"):
+                st["did"] = None      # la cause a change
+
             if mute >= self.WD_RESET and st["did"] is None \
                     and now - st["reset_at"] > self.WD_COOLDOWN:
-                # Une mesure en cours devient fausse : mieux vaut l'abandonner
-                # franchement que de la laisser croire qu'elle vaut quelque
-                # chose.
                 self._wd_abort("appareil muet pendant un relevé")
-                res = usbreset.reset([serial])
-                err = res.get(serial)
+                err = usbreset.reset([serial]).get(serial)
                 st.update(did="reset", reset_at=now, n=st["n"] + 1)
-                self._wd_say("%s : reinitialisation USB%s"
-                             % (serial, "" if err is None else " ECHOUEE : " + err))
+                self._wd_say("%s sourd alors que l'USB et les stations vont "
+                             "bien : reinitialisation%s"
+                             % (serial, "" if err is None
+                                else " ECHOUEE : " + err))
 
-            elif mute >= self.WD_GIVEUP and st["did"] == "reset":
-                # La reinitialisation n'a pas suffi : libsurvive n'enumere
-                # qu'au demarrage, donc seul un redemarrage du processus peut
-                # reprendre l'appareil. systemd nous relance (Restart=on-failure).
+            elif mute >= self.WD_GIVEUP and st["did"] == "reset" \
+                    and st["n"] < self.WD_TRIES:
                 st["did"] = "restart"
-                self._wd_say("%s toujours muet : redemarrage de la console."
-                             % serial)
+                self._wd_say("%s toujours sourd : redemarrage de la console "
+                             "pour que libsurvive re-enumere." % serial)
                 self.stop.set()
                 threading.Thread(target=self._wd_exit, daemon=True).start()
+
+            elif mute >= self.WD_GIVEUP and st["n"] >= self.WD_TRIES \
+                    and st["did"] != "abandon":
+                st["did"] = "abandon"
+                self._wd_say("%s : abandon apres %d tentatives. Il faut "
+                             "regarder le materiel." % (serial, st["n"]))
 
     def _wd_exit(self):
         time.sleep(0.5)
@@ -705,6 +754,140 @@ class Hub:
             self.sweep = None
             self.sweep_result = None
             self._wd_say("Balayage %s abandonne : %s." % (name, why))
+
+    # -- table objectif <-> reel -------------------------------------------
+
+    def _load_lens(self):
+        try:
+            with open(LENS_PATH) as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                self.lens = {k: list(d.get(k) or [])
+                             for k in ("focus", "zoom", "nodal")}
+        except (OSError, ValueError):
+            pass
+
+    def _save_lens(self):
+        try:
+            with open(LENS_PATH, "w") as f:
+                json.dump(self.lens, f, indent=2)
+                f.write("\n")
+        except OSError as e:
+            self.msg = "lens.json non ecrit : %s" % e
+
+    def lens_add(self, kind, value):
+        """Releve un point : la valeur reelle et les DEUX comptes courants.
+
+        Les deux, parce que sur beaucoup d'optiques la distance de mise au
+        point depend de la position du zoom — c'est pour cela que le
+        LensFile d'Unreal indexe ses tables sur les deux axes. Ne relever
+        que le compte de l'axe concerne rendrait la table fausse des qu'on
+        change de focale.
+
+        Les distances de foyer se mesurent depuis le repere PHI grave sur le
+        boitier, c'est-a-dire le plan focal — la surface du capteur — et non
+        depuis la lentille frontale.
+
+        Le « nodal » est autre chose : le decalage x;y;z en mm du tracker
+        vers la PUPILLE D'ENTREE, le point autour duquel il faut pivoter pour
+        eviter la parallaxe et qui est l'origine de la camera virtuelle. Il
+        depend du zoom. Il se mesure dans Unreal ; on ne fait que le
+        conserver ici.
+        """
+        with self.lock:
+            if kind not in ("focus", "zoom", "nodal"):
+                self.msg = "Axe inconnu : %s" % kind
+                return
+
+            if kind == "nodal":
+                try:
+                    v = [float(x.strip().replace(",", "."))
+                         for x in str(value).split(";")]
+                    if len(v) != 3:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    self.msg = "Attendu : x;y;z en mm, par exemple -12;0;38"
+                    return
+            else:
+                try:
+                    v = float(str(value).replace(",", "."))
+                except (TypeError, ValueError):
+                    self.msg = "Valeur illisible."
+                    return
+                if v <= 0:
+                    self.msg = "La valeur doit etre positive."
+                    return
+
+            f = self.freed
+            if not f or not f.get("focus_ok") or not f.get("zoom_ok"):
+                self.msg = ("Les deux axes doivent etre calibres pour relever "
+                            "un point : la table les indexe tous les deux.")
+                return
+
+            self.lens[kind].append({
+                "v": v, "focus": f["focus"], "zoom": f["zoom"],
+                "t": time.strftime("%Y-%m-%d %H:%M:%S")})
+            # Le nodal se classe par zoom, puisque c'est de lui qu'il depend.
+            self.lens[kind].sort(key=lambda p: p["zoom"] if kind == "nodal"
+                                 else p["v"])
+            self._save_lens()
+            n = len(self.lens[kind])
+            if kind == "nodal":
+                self.msg = ("nodal : %+.1f;%+.1f;%+.1f mm a zoom %d (%d point%s)"
+                            % (v[0], v[1], v[2], f["zoom"], n,
+                               "s" if n > 1 else ""))
+            else:
+                self.msg = ("%s : %.3g %s -> focus %d, zoom %d (%d point%s)"
+                            % (kind, v, "m" if kind == "focus" else "mm",
+                               f["focus"], f["zoom"], n, "s" if n > 1 else ""))
+
+    def lens_del(self, kind, index):
+        with self.lock:
+            try:
+                p = self.lens[kind].pop(int(index))
+            except (KeyError, ValueError, IndexError):
+                self.msg = "Point introuvable."
+                return
+            self._save_lens()
+            self.msg = "Point %s retire." % (p["v"],)
+
+    def lens_csv(self):
+        """Table en CSV, une ligne par point.
+
+        Format neutre et lisible : le chemin d'import exact dans Unreal 5.8
+        reste a confirmer sur place, et une table qu'on peut relire et
+        corriger a la main vaut mieux qu'un binaire opaque.
+        """
+        with self.lock:
+            L = ["# free-D — table objectif <-> reel",
+                 "# genere %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
+                 "#",
+                 "# axe    : focus, zoom ou nodal",
+                 "# reel   : metres (focus), millimetres (zoom),",
+                 "#          x;y;z en mm du tracker vers la pupille (nodal)",
+                 "# focus  : compte Free-D 0-65535 de l'axe focus",
+                 "# zoom   : compte Free-D 0-65535 de l'axe zoom",
+                 "#",
+                 "# Les distances de foyer se mesurent depuis le repere PHI",
+                 "# grave sur le boitier — le plan focal, donc la surface du",
+                 "# capteur. Pas depuis la lentille frontale.",
+                 "#",
+                 "# Le nodal est le decalage tracker -> PUPILLE D'ENTREE, le",
+                 "# point autour duquel pivoter pour eviter la parallaxe. Il",
+                 "# depend du zoom : une ligne par focale.",
+                 "#",
+                 "# Les DEUX comptes sont releves a chaque point : sur",
+                 "# beaucoup d'optiques la distance de mise au point depend",
+                 "# de la focale, et le LensFile d'Unreal indexe ses tables",
+                 "# sur les deux axes pour cette raison.",
+                 "axe,reel,focus,zoom,releve_le"]
+            for kind in ("focus", "zoom", "nodal"):
+                for p in self.lens[kind]:
+                    v = (";".join("%g" % x for x in p["v"])
+                         if isinstance(p["v"], list) else "%g" % p["v"])
+                    L.append("%s,%s,%d,%d,%s"
+                             % (kind, v, p["focus"], p["zoom"], p["t"]))
+            return "\n".join(L) + "\n"
 
     # -- guide -------------------------------------------------------------
 
@@ -1315,6 +1498,7 @@ class Hub:
             out["results"] = self.results
             out["roles"] = dict(self.roles)
             out["presets"] = self.presets()
+            out["lens"] = self.lens
             out["guide"] = self.guide()   # sous verrou, voir guide()
             out["preset_emit"] = self.preset_emit
             out["wd"] = {
@@ -1596,6 +1780,7 @@ ol.gd .why{grid-column:2;font-size:11.5px;line-height:1.35;color:var(--dim);
   <div class="tab" data-t="axes">Objectifs<span class="chk" id="c-axes"></span></div>
   <div class="tab" data-t="test">Test<span class="chk" id="c-test"></span></div>
   <div class="tab" data-t="out">Sortie<span class="chk" id="c-out"></span></div>
+  <div class="tab" data-t="lens">Objectif réel<span class="chk" id="c-lens"></span></div>
   <div style="margin-left:auto" class="eyebrow" id="hdr"></div>
 </header>
 
@@ -1799,6 +1984,59 @@ ol.gd .why{grid-column:2;font-size:11.5px;line-height:1.35;color:var(--dim);
       ce qui part sur le câble, quantification comprise.</p></div>
   </div>
 </div></div>
+<!-- ------------------------------------------------- OBJECTIF REEL -->
+<div class="pane" id="p-lens"><div class="grid">
+  <div>
+    <div class="card"><h3>Comptes en direct</h3><div id="lnow"></div>
+      <p class="note">Le Free-D transporte des <b>comptes 0–65535</b>, pas des
+      mètres. Unreal ne peut pas en déduire une distance : c'est cette table
+      qui le lui apprend, via son LensFile.</p></div>
+    <div class="card"><h3>Point de foyer</h3>
+      <div class="row"><label>Distance (m)</label><input id="lf-v" placeholder="2.5"></div>
+      <button class="go" style="width:100%;margin-top:9px" id="b-lf">Capturer</button>
+      <p class="note">Distance mesurée au ruban <b>depuis le repère ϕ gravé
+      sur le boîtier</b> — le plan focal, donc la surface du capteur. Pas
+      depuis la lentille frontale, pas depuis le trépied.</p>
+      <p class="note">Fais le point à l'œil sur le moniteur, puis capture :
+      1 m, 1,5, 2, 3, 5, 10, puis l'infini.</p></div>
+    <div class="card"><h3>Point de zoom</h3>
+      <div class="row"><label>Focale (mm)</label><input id="lz-v" placeholder="35"></div>
+      <button class="go" style="width:100%;margin-top:9px" id="b-lz">Capturer</button>
+      <p class="note">Positionne la bague sur une graduation gravée du fût.
+      Au moins les deux butées et trois points au milieu.</p></div>
+    <div class="card"><h3>Décalage nodal</h3>
+      <div class="row"><label>x;y;z (mm)</label><input id="ln-v" placeholder="-12;0;38"></div>
+      <button class="go" style="width:100%;margin-top:9px" id="b-ln">Capturer</button>
+      <p class="note">Décalage du <b>tracker</b> vers la <b>pupille
+      d'entrée</b>, mesuré dans Unreal (Camera Calibration → Nodal Offset).
+      Dépend du zoom : un point par focale. Valeurs négatives admises.</p></div>
+  </div>
+  <div>
+    <div class="card"><h3>Table relevée</h3>
+      <table><tbody id="ltab"></tbody></table>
+      <div style="margin-top:10px">
+        <a href="lens.csv" target="_blank"><button>Exporter en CSV</button></a>
+      </div></div>
+    <div class="card"><h3>Comment s'y prendre</h3>
+      <p class="note"><b>Les deux comptes sont relevés à chaque point.</b> Sur
+      beaucoup d'optiques la distance de mise au point dépend de la focale —
+      c'est pourquoi le LensFile indexe ses tables sur les deux axes. Une
+      table relevée à une seule focale serait fausse dès que tu zoomes.</p>
+      <p class="note">Fais donc une série de points de foyer <b>par
+      focale</b> : grand angle, milieu, longue focale.</p>
+      <p class="note">Les bagues ne sont pas bloquées ici, contrairement à
+      l'onglet Test.</p>
+      <p class="note" style="color:var(--warn)"><b>Le décalage nodal est
+      indispensable.</b> Le tracker est vissé sur la cage ; la pose qu'il
+      rapporte est la sienne, pas celle de la pupille d'entrée — le point
+      autour duquel il faut pivoter pour éviter la parallaxe, et qui est
+      l'origine de la caméra virtuelle. Sans lui, la caméra virtuelle pivote
+      autour du tracker : l'erreur est faible loin, franche près du sujet.</p>
+      <p class="note">Le chemin d'import exact dans Unreal 5.8 reste à
+      confirmer sur place. Le CSV est volontairement lisible et corrigeable
+      à la main.</p></div>
+  </div>
+</div></div>
 </main>
 
 <div class="bar" id="msg">Prêt.</div>
@@ -1853,6 +2091,9 @@ function build(){
     +encodeURIComponent($("eport").value));
   $("b-emit-stop").onclick=()=>go("emit_stop=1");
   $("b-pset-save").onclick=()=>go("preset_save="+encodeURIComponent($("pname").value));
+  $("b-lf").onclick=()=>go("lens_add=focus&value="+encodeURIComponent($("lf-v").value));
+  $("b-lz").onclick=()=>go("lens_add=zoom&value="+encodeURIComponent($("lz-v").value));
+  $("b-ln").onclick=()=>go("lens_add=nodal&value="+encodeURIComponent($("ln-v").value));
   $("b-wd-on").onclick=()=>go("wd=1");
   $("b-wd-off").onclick=()=>go("wd=0");
   $("b-ph-stop").onclick=()=>go("phase_stop=1");
@@ -1868,7 +2109,43 @@ ev.onmessage=e=>{const s=JSON.parse(e.data);last=s;
   $("hdr").style.color=s.clock_ok?"var(--dim)":"var(--warn)";
   $("c-out").textContent=(s.emit&&s.emit.on)?"✓":"";
   $("c-dev").textContent=(s.role_defs||[]).every(([k])=>s.roles&&s.roles[k])?"✓":"";
-  health(s);guide(s);roles(s);devices(s);studio(s);axes(s);test(s);outp(s)};
+  health(s);guide(s);roles(s);devices(s);studio(s);axes(s);test(s);outp(s);
+  lens(s)};
+
+// Table objectif <-> reel. Les comptes viennent de la meme trame que
+// l'onglet Sortie : ce qu'on releve est ce qui part vers Unreal.
+function lens(s){
+  const f=s.freed,now=$("lnow");
+  if(now)now.innerHTML=(f&&f.focus_ok&&f.zoom_ok)
+    ? '<table><tbody><tr><td>foyer</td><td class="mono big" style="text-align:right">'
+      +f.focus+'</td><td class="dim">/65535</td></tr>'
+      +'<tr><td>zoom</td><td class="mono big" style="text-align:right">'
+      +f.zoom+'</td><td class="dim">/65535</td></tr></tbody></table>'
+    : '<p class="note" style="color:var(--warn)">Les deux axes doivent être '
+      +'calibrés : la table les indexe tous les deux.</p>';
+  const tb=$("ltab");if(!tb)return;
+  const L=s.lens||{};
+  const rows=[];
+  for(const k of ["focus","zoom","nodal"]){
+    const u=k==="focus"?"m":"mm";
+    (L[k]||[]).forEach((p,i)=>rows.push(
+      '<tr><td class="dim">'+k+'</td><td class="mono">'
+      +(Array.isArray(p.v)?p.v.join(" ; "):p.v)+' '+u+'</td>'
+      +'<td class="mono dim" style="text-align:right">f '+p.focus+'</td>'
+      +'<td class="mono dim" style="text-align:right">z '+p.zoom+'</td>'
+      +'<td style="text-align:right"><button class="ldel stop" data-k="'+k
+      +'" data-i="'+i+'">×</button></td></tr>'));
+  }
+  const sig=rows.join("");
+  if(tb.dataset.sig!==sig){
+    tb.dataset.sig=sig;
+    tb.innerHTML=sig||'<tr><td class="note">Aucun point relevé.</td></tr>';
+    tb.querySelectorAll(".ldel").forEach(b=>b.onclick=()=>
+      go("lens_del="+b.dataset.k+"&index="+b.dataset.i));
+  }
+  $("c-lens").textContent=((L.focus||[]).length>=3&&(L.zoom||[]).length>=3
+    &&(L.nodal||[]).length>=1)?"✓":"";
+}
 
 // Le guide. L'etat vient du serveur, pas d'une deduction ici : il est ainsi
 // couvert par le --selftest. On ne fait que l'afficher.
@@ -2428,6 +2705,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:                      # noqa: BLE001
                 h.msg = "Erreur : %s" % e
             return self._send("{}")
+        if path == "/lens.csv":
+            return self._send(h.lens_csv(), "text/csv; charset=utf-8")
         if path == "/report":
             return self._send(h.report(), "text/plain; charset=utf-8")
         if path == "/stream":
@@ -2489,6 +2768,10 @@ class Handler(BaseHTTPRequestHandler):
             h.preset_load(q["preset_load"])
         elif "preset_del" in q:
             h.preset_delete(q["preset_del"])
+        elif "lens_add" in q:
+            h.lens_add(q["lens_add"], q.get("value", ""))
+        elif "lens_del" in q:
+            h.lens_del(q["lens_del"], q.get("index", -1))
 
 
 def selftest():
@@ -2506,17 +2789,18 @@ def selftest():
     l'axes.json reel et l'auto-test ne dirait plus la meme chose selon
     l'etat de calibration de la machine.
     """
-    global AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS
-    saved = (AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS)
+    global AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS, LENS_PATH
+    saved = (AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS, LENS_PATH)
     tmp = tempfile.mkdtemp(prefix="vp-console-selftest-")
     AXES_PATH = os.path.join(tmp, "axes.json")
     WORLD_PATH = os.path.join(tmp, "world.json")
     ROLES_PATH = os.path.join(tmp, "roles.json")
     PRESETS = os.path.join(tmp, "presets")
+    LENS_PATH = os.path.join(tmp, "lens.json")
     try:
         return _selftest_run()
     finally:
-        AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS = saved
+        AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS, LENS_PATH = saved
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -2645,6 +2929,51 @@ def _selftest_run():
         hub.sweep_save()
     assert set(hub.axes) == {"focus", "zoom"}
 
+    # -- table objectif <-> reel ------------------------------------------
+    # Le Free-D transporte des comptes, pas des metres. Sans cette table,
+    # Unreal ne peut pas isoler un objet a une distance donnee.
+    assert wait(lambda: hub.freed and hub.freed.get("focus_ok")
+                and hub.freed.get("zoom_ok"), 10.0), hub.freed
+    hub.lens = {"focus": [], "zoom": [], "nodal": []}
+    hub.lens_add("focus", "2.5")
+    hub.lens_add("focus", "1,5")            # virgule decimale acceptee
+    hub.lens_add("zoom", "35")
+    assert [p["v"] for p in hub.lens["focus"]] == [1.5, 2.5], hub.lens
+    print("objectif  : points releves, tries par valeur")
+
+    p0 = hub.lens["focus"][0]
+    assert "focus" in p0 and "zoom" in p0, p0
+    print("objectif  : chaque point porte les DEUX comptes")
+
+    for bad in ("", "abc", "-2", "0"):
+        n = len(hub.lens["focus"])
+        hub.lens_add("focus", bad)
+        assert len(hub.lens["focus"]) == n, "valeur %r acceptee" % bad
+    print("garde     : valeur de foyer illisible ou negative -> refuse")
+
+    hub.lens_add("nodal", "-12;0;38")
+    assert hub.lens["nodal"][0]["v"] == [-12.0, 0.0, 38.0], hub.lens["nodal"]
+    for bad in ("12;0", "a;b;c", "", "1;2;3;4"):
+        n = len(hub.lens["nodal"])
+        hub.lens_add("nodal", bad)
+        assert len(hub.lens["nodal"]) == n, "nodal %r accepte" % bad
+    print("objectif  : decalage nodal x;y;z, negatifs admis")
+
+    saved_freed, hub.freed = hub.freed, None
+    n = len(hub.lens["zoom"])
+    hub.lens_add("zoom", "50")
+    assert len(hub.lens["zoom"]) == n, "point releve sans trame Free-D"
+    hub.freed = saved_freed
+    print("garde     : axes non calibres -> releve refuse")
+
+    csv = hub.lens_csv()
+    assert "axe,reel,focus,zoom" in csv, csv[:200]
+    assert "focus,2.5," in csv and "nodal,-12;0;38," in csv, csv
+    hub.lens_del("focus", 0)
+    assert len(hub.lens["focus"]) == 1, hub.lens
+    print("objectif  : export CSV et suppression d'un point")
+    hub.lens = {"focus": [], "zoom": [], "nodal": []}
+
     # -- presets ----------------------------------------------------------
     # Un preset regroupe roles + repere + axes : ce qui rappelle un studio
     # d'un coup, une fois les trackers visses.
@@ -2710,65 +3039,95 @@ def _selftest_run():
     # EN SERVICE et on verifie l'escalade, en neutralisant la
     # reinitialisation USB — la demo n'a pas de peripherique reel.
     resets = []
-    real_reset = usbreset.reset
+    real_reset, real_devices = usbreset.reset, usbreset.valve_devices
     usbreset.reset = lambda serials=None: (resets.append(list(serials or [])),
                                            {x: None for x in (serials or [])})[1]
+    # La demo n'a pas de peripherique reel, et c'est desormais l'USB qui
+    # commande la surveillance : on le decrit nous-memes.
+    usb_on = [True]
+    usbreset.valve_devices = lambda: ([(k, "", "") for k in hub.dev]
+                                      if usb_on[0] else [])
     try:
         hub.wd_log.clear()
         hub.wd_state.clear()
         cam = hub.roles["camera"]
 
-        # Un appareil SANS role ne doit rien declencher.
-        hub.wd_last = 0.0
+        def tick(back=None):
+            if back is not None:
+                with hub.lock:
+                    hub.dev[cam]["t"] = time.monotonic() - back
+            hub.wd_last = 0.0
+            hub._watchdog(time.monotonic())
+
         with hub.lock:
             hub.dev["DEMO-SURV2"] = {"travel": 0.0, "pos": (0, 0, 0), "n": 1,
                                      "t": time.monotonic() - 999,
                                      "ts": collections.deque(maxlen=400)}
-        hub._watchdog(time.monotonic())
+        tick()
         assert not resets, "un appareil sans role a declenche un reset"
-        print("garde     : appareil sans role -> ignore par la surveillance")
+        print("garde     : appareil sans role -> ignore")
 
-        # Muet 4 s : signale, mais pas encore de reinitialisation.
-        with hub.lock:
-            hub.dev[cam]["t"] = time.monotonic() - 4.0
-        hub.wd_last = 0.0
-        hub._watchdog(time.monotonic())
+        tick(4.0)
         assert not resets, "reset premature a 4 s"
-        assert any("ne repond plus" in m for _t, m in hub.wd_log), hub.wd_log
         print("garde     : muet 4 s -> signale, aucune action")
 
-        # Muet 12 s : reinitialisation USB de CET appareil seulement.
-        with hub.lock:
-            hub.dev[cam]["t"] = time.monotonic() - 12.0
-        hub.wd_last = 0.0
-        hub._watchdog(time.monotonic())
+        tick(12.0)
         assert resets == [[cam]], resets
-        print("garde     : muet 12 s -> reinitialisation USB ciblee")
+        print("garde     : sourd, USB et stations bonnes -> reinitialise")
 
-        # Retour a la normale : la surveillance doit le dire.
+        # ABSENT DE L'USB : rien a reinitialiser.
+        resets.clear(); hub.wd_state.clear(); hub.wd_log.clear()
+        usb_on[0] = False
+        tick(30.0); tick(30.0)
+        assert not resets, "reset sur un appareil absent de l'USB"
+        assert any("absent de l'USB" in m for _t, m in hub.wd_log), hub.wd_log
+        print("garde     : absent de l'USB -> aucune action, cause nommee")
+        usb_on[0] = True
+
+        # PERSONNE ne voit les stations : elles sont eteintes.
+        resets.clear(); hub.wd_state.clear(); hub.wd_log.clear()
         with hub.lock:
-            hub.dev[cam]["t"] = time.monotonic()
-        hub.wd_last = 0.0
-        hub._watchdog(time.monotonic())
-        assert any("repond de nouveau" in m for _t, m in hub.wd_log), hub.wd_log
+            keep = {k: v["t"] for k, v in hub.dev.items()}
+            for v in hub.dev.values():
+                v["t"] = time.monotonic() - 60.0
+        tick(); tick()
+        assert not resets, "reset alors qu'aucune station n'est vue"
+        assert any("base stations" in m for _t, m in hub.wd_log), hub.wd_log
+        print("garde     : stations eteintes -> aucune action, cause nommee")
+        with hub.lock:
+            for k, t0 in keep.items():
+                if k in hub.dev:
+                    hub.dev[k]["t"] = t0
+
+        resets.clear(); hub.wd_state.clear()
+        tick(0.0); tick(0.0)
+        assert not resets
         print("garde     : retour de l'appareil -> signale")
 
-        # Surveillance arretee : plus aucune action.
         resets.clear()
         hub.wd_on = False
-        with hub.lock:
-            hub.dev[cam]["t"] = time.monotonic() - 99.0
-        hub.wd_last = 0.0
-        hub._watchdog(time.monotonic())
+        tick(99.0)
         assert not resets, "la surveillance arretee a agi"
         hub.wd_on = True
+
+        # Trois tentatives sans effet : abandon, pas de boucle nocturne.
+        resets.clear(); hub.wd_log.clear(); hub.wd_state.clear()
+        for _ in range(10):
+            st = hub.wd_state.get(cam)
+            if st and st.get("did") == "reset" and st.get("n", 0) < hub.WD_TRIES:
+                st["did"] = None
+                st["reset_at"] = 0.0
+            tick(99.0)
+        assert len(resets) <= hub.WD_TRIES, resets
+        assert any("abandon" in m for _t, m in hub.wd_log), hub.wd_log
+        print("garde     : 3 tentatives sans effet -> abandon")
+
         hub.wd_state.clear()
         with hub.lock:
             hub.dev[cam]["t"] = time.monotonic()
             del hub.dev["DEMO-SURV2"]
-        print("garde     : surveillance arretee -> n'agit plus")
     finally:
-        usbreset.reset = real_reset
+        usbreset.reset, usbreset.valve_devices = real_reset, real_devices
 
     # -- test -------------------------------------------------------------
     hub.test_arm()

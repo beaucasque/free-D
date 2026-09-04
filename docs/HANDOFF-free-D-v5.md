@@ -332,6 +332,39 @@ couvert par le `--selftest`. Quatre états, à trois couleurs :
 L'ambre est le plus utile des trois : il distingue une calibration obtenue
 d'une calibration **conservée**.
 
+### Onglet Objectif réel — la table que réclame le LensFile
+
+Le Free-D transporte le zoom et le foyer comme des **comptes 0–65535** : des
+positions de bague normalisées, pas des millimètres ni des mètres. Unreal ne
+peut pas en déduire que « le foyer est à 3,20 m ». C'est le rôle de son
+**LensFile**, et la table est à relever ici.
+
+Trois relevés, chacun conservant **les deux comptes** :
+
+| relevé | ce qu'on saisit | pourquoi |
+|---|---|---|
+| foyer | distance en mètres | dépend aussi de la focale sur beaucoup d'optiques |
+| zoom | focale en millimètres | graduations gravées du fût |
+| nodal | `x;y;z` en mm | décalage tracker → pupille d'entrée, dépend du zoom |
+
+**Les distances de foyer se mesurent depuis le repère ϕ** gravé sur le
+boîtier — le plan focal, donc la surface du capteur. Pas depuis la lentille
+frontale, pas depuis le trépied.
+
+**Le décalage nodal est indispensable et n'est pas mesuré ici.** Le tracker
+est vissé sur la cage ; la pose qu'il rapporte est la sienne, pas celle de
+la **pupille d'entrée** — le point situé dans l'objectif autour duquel il
+faut faire pivoter pour éviter la parallaxe, et qui correspond à l'origine
+de la caméra virtuelle. Sa position **change avec le zoom**, et légèrement
+avec le foyer. Sans lui, la caméra virtuelle pivote autour du tracker :
+l'erreur est faible loin du sujet, franche près. Unreal sait le mesurer à la
+mire (Camera Calibration → Nodal Offset) ; la console ne fait que le
+conserver, pour qu'il vive dans le preset.
+
+Export en CSV par `/lens.csv`. Le chemin d'import exact dans Unreal 5.8
+reste à confirmer sur place ; le format est volontairement lisible et
+corrigeable à la main.
+
 ### Onglet Appareils
 
 Le premier, et il conditionne tout le reste. La liste montre chaque appareil
@@ -456,11 +489,24 @@ tracker, `LHB-` pour une base station.
 **Surveillance et récupération automatiques.** La console garde les
 appareils **en service** — ceux qui portent un rôle — et escalade seule :
 
+Le déclencheur est l'**USB**, pas l'absence de pose : réinitialiser un
+périphérique parce qu'une base station est éteinte n'aurait aucun sens.
+Trois cas distingués :
+
+| situation | action |
+|---|---|
+| absent de l'USB | câble, port ou alimentation — signalé, **aucune action** |
+| présent, muet, **personne** ne voit les stations | stations éteintes ou tous hors champ — signalé, **aucune action** |
+| présent, muet, mais **d'autres** produisent des poses | le tracker est **sourd** : c'est le seul cas réparable |
+
+Dans ce dernier cas seulement, l'escalade :
+
 | muet depuis | action |
 |---|---|
-| 3 s | signalé, rien de plus |
-| 10 s | réinitialisation USB de cet appareil ; la mesure en cours est abandonnée |
+| 3 s | signalé |
+| 10 s | réinitialisation USB ; la mesure en cours est abandonnée |
 | 40 s | la console redémarre, pour que libsurvive ré-énumère |
+| 3 tentatives | abandon — sinon la console bouclerait toute la nuit |
 
 Éprouvé sur matériel le 3 septembre 2026 : coupure d'un tracker en service,
 signalement à 6 s, réinitialisation à 16 s, redémarrage à 34 s, appareil
