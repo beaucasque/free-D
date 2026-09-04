@@ -419,6 +419,28 @@ module — c'est ce que fait `survive_clock.object_names()`, sur lequel la
 console et le bridge s'appuient tous les deux. Préfixes : `LHR-` pour un
 tracker, `LHB-` pour une base station.
 
+**Surveillance et récupération automatiques.** La console garde les
+appareils **en service** — ceux qui portent un rôle — et escalade seule :
+
+| muet depuis | action |
+|---|---|
+| 3 s | signalé, rien de plus |
+| 10 s | réinitialisation USB de cet appareil ; la mesure en cours est abandonnée |
+| 40 s | la console redémarre, pour que libsurvive ré-énumère |
+
+Éprouvé sur matériel le 3 septembre 2026 : coupure d'un tracker en service,
+signalement à 6 s, réinitialisation à 16 s, redémarrage à 34 s, appareil
+revenu à 244 Hz — sans intervention.
+
+Un tracker de rechange sur l'établi ne déclenche rien : sans rôle, il n'est
+pas surveillé.
+
+**Ce que ça ne répare pas.** Une **occlusion optique**. Si un corps passe
+devant un tracker, aucun logiciel ne le fera voir : la surveillance le
+signale et constate le retour. C'est aussi pourquoi le §2 impose un tracker
+d'objectif de chaque côté du bloc optique — la redondance est mécanique,
+pas logicielle.
+
 **Un tracker peut rester sourd aux base stations.** Constaté le 3 septembre
 2026 : trois trackers ouverts par libsurvive, firmware lu, mais aucune ligne
 `LightcapMode` et jamais une pose — pendant qu'un quatrième, au même endroit,

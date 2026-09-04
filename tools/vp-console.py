@@ -60,6 +60,7 @@ sys.path.insert(0, BRIDGE)
 import freed           # noqa: E402
 import lensaxis        # noqa: E402
 import survive_clock   # noqa: E402
+import usbreset        # noqa: E402
 import worldframe      # noqa: E402
 
 AXES_PATH = os.path.join(BRIDGE, "axes.json")
@@ -170,6 +171,16 @@ class Hub:
         self._emit_c = 0
         self.results = {}        # onglet Test : verdicts figes par phase
 
+        # -- chien de garde ------------------------------------------------
+        # Ce qui est recuperable par logiciel l'est automatiquement : un
+        # tracker bloque (ouvert mais sourd) et une enumeration manquee. Ce
+        # qui ne l'est PAS : une occlusion optique. On la signale, on ne
+        # pretend pas la reparer.
+        self.wd_on = True
+        self.wd_log = []         # dernieres actions, pour l'interface
+        self.wd_state = {}       # par serie : depuis quand muet, quoi tente
+        self.wd_last = 0.0
+
         # Roles attribues a la main, une fois pour toutes, avant toute
         # calibration. Ils portent des NUMEROS DE SERIE : le §8 interdit de
         # lier un appareil a son rang d'enumeration, et on a la preuve que
@@ -268,6 +279,7 @@ class Hub:
 
     def _resolve(self, now):
         self._prepare_frame()
+        self._watchdog(now)
         if self.capture and now > self.capture[2]:
             self.capture = None
 
@@ -586,6 +598,111 @@ class Hub:
 
     # -- objectifs ---------------------------------------------------------
 
+    # -- chien de garde ----------------------------------------------------
+
+    # Un tracker en service qui se tait passe par ces paliers. Les delais
+    # sont longs a dessein : une occlusion d'une seconde est banale sur un
+    # plateau, et reinitialiser a chaque passage devant l'objectif serait
+    # pire que le mal.
+    WD_STALE = 3.0        # muet au-dela : signale, rien de plus
+    WD_RESET = 10.0       # muet au-dela : reinitialisation USB
+    WD_GIVEUP = 40.0      # muet au-dela malgre le reset : re-enumeration
+    WD_COOLDOWN = 30.0    # delai minimal entre deux resets du meme appareil
+
+    def _wd_say(self, msg):
+        self.wd_log.insert(0, (time.strftime("%H:%M:%S"), msg))
+        del self.wd_log[12:]
+        self.msg = msg
+
+    def _watchdog(self, now):
+        """Surveille les appareils EN SERVICE et tente de les recuperer.
+
+        Seuls les appareils portant un role sont surveilles : un tracker de
+        rechange pose sur l'etabli n'a pas a declencher quoi que ce soit.
+
+        Ce qui est recuperable ici : un tracker ouvert mais sourd (aucune
+        pose alors que libsurvive l'a bien ouvert) et une enumeration
+        manquee. Ce qui ne l'est PAS : une occlusion optique — on la
+        signale, on n'y peut rien.
+        """
+        if not self.wd_on or now - self.wd_last < 1.0:
+            return
+        self.wd_last = now
+
+        served = {v for v in self.roles.values() if v}
+        if not served:
+            self.wd_state.clear()
+            return
+
+        for serial in served:
+            d = self.dev.get(serial)
+            age = (now - d["t"]) if d else None
+            st = self.wd_state.setdefault(serial, {"since": None, "did": None,
+                                                   "reset_at": 0.0, "n": 0})
+
+            if age is not None and age < self.WD_STALE:
+                if st["since"] is not None:
+                    self._wd_say("%s repond de nouveau." % serial)
+                st.update(since=None, did=None)
+                continue
+
+            # Muet. « Depuis quand » se mesure sur la DERNIERE POSE, pas
+            # sur l'instant ou la surveillance l'a remarque : un appareil
+            # deja muet depuis dix minutes quand on demarre ne doit pas
+            # attendre dix secondes de plus. On ne retombe sur l'instant de
+            # detection que pour un appareil jamais vu, qui n'a pas d'age.
+            if st["since"] is None:
+                st["since"] = now
+                self._wd_say("%s ne repond plus." % serial)
+            mute = age if age is not None else (now - st["since"])
+
+            if mute >= self.WD_RESET and st["did"] is None \
+                    and now - st["reset_at"] > self.WD_COOLDOWN:
+                # Une mesure en cours devient fausse : mieux vaut l'abandonner
+                # franchement que de la laisser croire qu'elle vaut quelque
+                # chose.
+                self._wd_abort("appareil muet pendant un relevé")
+                res = usbreset.reset([serial])
+                err = res.get(serial)
+                st.update(did="reset", reset_at=now, n=st["n"] + 1)
+                self._wd_say("%s : reinitialisation USB%s"
+                             % (serial, "" if err is None else " ECHOUEE : " + err))
+
+            elif mute >= self.WD_GIVEUP and st["did"] == "reset":
+                # La reinitialisation n'a pas suffi : libsurvive n'enumere
+                # qu'au demarrage, donc seul un redemarrage du processus peut
+                # reprendre l'appareil. systemd nous relance (Restart=on-failure).
+                st["did"] = "restart"
+                self._wd_say("%s toujours muet : redemarrage de la console."
+                             % serial)
+                self.stop.set()
+                threading.Thread(target=self._wd_exit, daemon=True).start()
+
+    def _wd_exit(self):
+        time.sleep(0.5)
+        os._exit(70)          # EX_SOFTWARE : systemd relance
+
+    def _wd_abort(self, why):
+        """Invalide ce qui etait en cours de mesure."""
+        if self.capture:
+            slot = self.capture[0]
+            self.capture = None
+            self.slots[slot] = []
+            self._wd_say("Releve de %s abandonne : %s." % (slot, why))
+        if self.sweep:
+            name = self.sweep["name"]
+            self.sweep = None
+            self.sweep_result = None
+            self._wd_say("Balayage %s abandonne : %s." % (name, why))
+
+    def manual_reset(self, serial):
+        """Reinitialisation demandee a la main depuis l'interface."""
+        with self.lock:
+            self._wd_abort("reinitialisation demandee")
+            err = usbreset.reset([serial]).get(serial)
+            self._wd_say("%s : reinitialisation manuelle%s"
+                         % (serial, "" if err is None else " ECHOUEE : " + err))
+
     # -- roles -------------------------------------------------------------
 
     def _load_roles(self):
@@ -890,6 +1007,14 @@ class Hub:
             out["test"] = self._test_snapshot() if self.tap else None
             out["results"] = self.results
             out["roles"] = dict(self.roles)
+            out["wd"] = {
+                "on": self.wd_on,
+                "log": [{"t": t, "m": m} for t, m in self.wd_log],
+                "mute": {k: round(now - v["since"], 1)
+                         for k, v in self.wd_state.items()
+                         if v.get("since")},
+                "resets": {k: v["n"] for k, v in self.wd_state.items()
+                           if v.get("n")}}
             out["role_defs"] = [[k, lab] for k, lab in ROLES]
             out["freed"] = self.freed
             out["emit"] = {"on": self.sender is not None,
@@ -1170,6 +1295,23 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
       Changer le tracker <b>caméra</b> efface les deux axes — ils sont
       calibrés en relatif caméra.</p>
     </div>
+    <div class="card"><h3>Surveillance</h3>
+      <div id="wdstat" class="note"></div>
+      <div style="display:flex;gap:8px;margin:10px 0">
+        <button id="b-wd-on" class="go">Activer</button>
+        <button id="b-wd-off" class="stop">Arrêter</button>
+      </div>
+      <table><tbody id="wdlog"></tbody></table>
+      <p class="note">Seuls les appareils <b>en service</b> sont surveillés :
+      un tracker de rechange sur l'établi ne déclenche rien.</p>
+      <p class="note">Muet plus de 3 s : signalé. Plus de 10 s :
+      réinitialisation USB, et la mesure en cours est abandonnée — elle
+      serait fausse. Plus de 40 s malgré cela : la console redémarre pour que
+      libsurvive ré-énumère.</p>
+      <p class="note">Une <b>occlusion optique</b> ne se répare pas par
+      logiciel. La surveillance la signale et constate le retour, rien de
+      plus.</p>
+    </div>
   </div>
 </div></div>
 
@@ -1341,6 +1483,8 @@ function build(){
     +encodeURIComponent($("ehost").value)+"&eport="
     +encodeURIComponent($("eport").value));
   $("b-emit-stop").onclick=()=>go("emit_stop=1");
+  $("b-wd-on").onclick=()=>go("wd=1");
+  $("b-wd-off").onclick=()=>go("wd=0");
   $("b-ph-stop").onclick=()=>go("phase_stop=1");
 }
 
@@ -1390,6 +1534,28 @@ function roles(s){
     sel.style.color=want?(vu?"var(--ok)":"var(--bad)"):"var(--dim)";
     sel.title=want&&!vu?"attribué mais pas vu — débranché ?":"";
   }
+  // surveillance
+  const W=s.wd||{};
+  const st=$("wdstat");
+  if(st){
+    const mute=Object.entries(W.mute||{});
+    st.innerHTML = !W.on
+      ? '<span style="color:var(--warn)">● arrêtée</span>'
+      : (mute.length
+         ? '<span style="color:var(--bad)">● '+mute.map(([k,v])=>k+' muet '+v.toFixed(0)+' s').join('<br>● ')+'</span>'
+         : '<span style="color:var(--ok)">● tout répond</span>')
+      + (Object.keys(W.resets||{}).length
+         ? '<div class="dim" style="margin-top:6px">réinitialisations : '
+           +Object.entries(W.resets).map(([k,n])=>k.slice(-8)+' ×'+n).join(', ')+'</div>'
+         : '');
+  }
+  const lg=$("wdlog");
+  if(lg){
+    lg.innerHTML=(W.log||[]).map(e=>
+      '<tr><td class="mono dim">'+e.t+'</td><td>'+e.m+'</td></tr>').join('')
+      || '<tr><td class="note">Aucun incident.</td></tr>';
+  }
+
   const w=$("survey-who");
   if(w){w.textContent=cur.survey||"aucun appareil de relevé";
         w.style.color=cur.survey?"var(--ok)":"var(--warn)"}
@@ -1895,6 +2061,12 @@ class Handler(BaseHTTPRequestHandler):
             h.emit_start(q.get("ehost") or "127.0.0.1", q.get("eport") or 40000)
         elif "emit_stop" in q:
             h.emit_stop()
+        elif "wd" in q:
+            h.wd_on = q["wd"] == "1"
+            h.wd_state.clear()
+            h.msg = "Surveillance %s." % ("activee" if h.wd_on else "desactivee")
+        elif "reset_dev" in q:
+            h.manual_reset(q["reset_dev"])
 
 
 def selftest():
@@ -2049,6 +2221,72 @@ def _selftest_run():
         assert hub.sweep_result, hub.msg
         hub.sweep_save()
     assert set(hub.axes) == {"focus", "zoom"}
+
+    # -- chien de garde ---------------------------------------------------
+    # On PROVOQUE la panne : un chien de garde qu'on ne declenche pas est
+    # une illusion de securite. On antidate la derniere pose d'un appareil
+    # EN SERVICE et on verifie l'escalade, en neutralisant la
+    # reinitialisation USB — la demo n'a pas de peripherique reel.
+    resets = []
+    real_reset = usbreset.reset
+    usbreset.reset = lambda serials=None: (resets.append(list(serials or [])),
+                                           {x: None for x in (serials or [])})[1]
+    try:
+        hub.wd_log.clear()
+        hub.wd_state.clear()
+        cam = hub.roles["camera"]
+
+        # Un appareil SANS role ne doit rien declencher.
+        hub.wd_last = 0.0
+        with hub.lock:
+            hub.dev["DEMO-SURV2"] = {"travel": 0.0, "pos": (0, 0, 0), "n": 1,
+                                     "t": time.monotonic() - 999,
+                                     "ts": collections.deque(maxlen=400)}
+        hub._watchdog(time.monotonic())
+        assert not resets, "un appareil sans role a declenche un reset"
+        print("garde     : appareil sans role -> ignore par la surveillance")
+
+        # Muet 4 s : signale, mais pas encore de reinitialisation.
+        with hub.lock:
+            hub.dev[cam]["t"] = time.monotonic() - 4.0
+        hub.wd_last = 0.0
+        hub._watchdog(time.monotonic())
+        assert not resets, "reset premature a 4 s"
+        assert any("ne repond plus" in m for _t, m in hub.wd_log), hub.wd_log
+        print("garde     : muet 4 s -> signale, aucune action")
+
+        # Muet 12 s : reinitialisation USB de CET appareil seulement.
+        with hub.lock:
+            hub.dev[cam]["t"] = time.monotonic() - 12.0
+        hub.wd_last = 0.0
+        hub._watchdog(time.monotonic())
+        assert resets == [[cam]], resets
+        print("garde     : muet 12 s -> reinitialisation USB ciblee")
+
+        # Retour a la normale : la surveillance doit le dire.
+        with hub.lock:
+            hub.dev[cam]["t"] = time.monotonic()
+        hub.wd_last = 0.0
+        hub._watchdog(time.monotonic())
+        assert any("repond de nouveau" in m for _t, m in hub.wd_log), hub.wd_log
+        print("garde     : retour de l'appareil -> signale")
+
+        # Surveillance arretee : plus aucune action.
+        resets.clear()
+        hub.wd_on = False
+        with hub.lock:
+            hub.dev[cam]["t"] = time.monotonic() - 99.0
+        hub.wd_last = 0.0
+        hub._watchdog(time.monotonic())
+        assert not resets, "la surveillance arretee a agi"
+        hub.wd_on = True
+        hub.wd_state.clear()
+        with hub.lock:
+            hub.dev[cam]["t"] = time.monotonic()
+            del hub.dev["DEMO-SURV2"]
+        print("garde     : surveillance arretee -> n'agit plus")
+    finally:
+        usbreset.reset = real_reset
 
     # -- test -------------------------------------------------------------
     hub.test_arm()
