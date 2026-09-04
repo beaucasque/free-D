@@ -49,6 +49,40 @@ cher (perte de tour sur un axe multi-tour).
 HTC recommande plus de 2 m de haut et 25–35° vers le bas ; champ 150° H,
 110° V. Les stations 2.0 n'ont pas besoin de se voir.
 
+### 2ter. La caméra, l'objectif et le montage des trackers d'objectif
+
+**Blackmagic Production Camera 4K.** Capteur Super 35, **21,12 × 11,88 mm**,
+4000 × 2160, monture EF. C'est le *Filmback* à régler dans la CineCamera
+d'Unreal — à confirmer sur la fiche technique Blackmagic avant de le figer :
+une erreur là fausse tout le cadrage virtuel.
+
+**Objectif Rokinon 35 mm T1.4.** Échelle de foyer gravée : 0,3 — 0,35 — 0,4
+— 0,5 — 0,7 — 1 — 1,5 — 2 — 3 — 10 — ∞ m. Ce sont les points à relever dans
+la table de l'onglet Objectif réel ; les gravures donnent le squelette, à
+vérifier au ruban depuis le repère ϕ. La course de la bague paraît proche de
+270°, donc **sous 360° : axe absolu au démarrage, pas de homing**.
+
+*(À confirmer : la présence et les graduations d'une bague de zoom. La
+console suppose deux axes, ce qui reste valable dans les deux cas.)*
+
+**Montage des trackers d'objectif.** Un adaptateur se visse au 1/4-20 du
+tracker et son embout carré s'engage au **centre des molettes** de foyer et
+de zoom : le tracker tourne donc du même angle que la bague, ce qu'attend
+`lensaxis`. Quatre points à régler au montage :
+
+- **Le câble se vrille.** Le tracker pivote de toute la course de la bague
+  avec son USB au ventre. Boucle de service généreuse et serre-câble sur le
+  rail, sinon la torsion s'accumule au connecteur (§7).
+- **Le tracker tourne le dos aux stations.** Sa face avant balaie un secteur
+  entier : à certaines positions de bague, ses photodiodes regardent
+  ailleurs. Orienter l'embout pour que le secteur balayé reste tourné vers
+  les stations, et vérifier en butée que la crête ne saute pas.
+- **Les deux molettes risquent d'être du même côté**, ce que le §2 interdit
+  — les deux trackers seraient masqués ensemble par le corps caméra.
+- **Le porte-à-faux.** ~75 g en bout d'adaptateur peut ajouter du jeu ou
+  fléchir. `MountWatch` surveille la distance caméra ↔ objectif, constante
+  mécanique, et signale `SLIP` au-delà de 8 mm de dérive.
+
 ### 2bis. Le relevé du plateau se fait avec un tracker, pas un contrôleur
 
 Décidé le 31 août 2026, après essai. Les contrôleurs sont **abandonnés**.
