@@ -12,3 +12,6 @@ __pycache__/
 
 # Roles attribues a la main, propres a une installation.
 bridge/roles.json
+
+# Presets de studio : propres a une installation.
+bridge/presets/

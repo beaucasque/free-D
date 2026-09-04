@@ -140,6 +140,20 @@ rapporté.
 | Appliqué à | tout | tracker **caméra** seul | **zoom** et **focus** seuls |
 | Refaire si | un appareil est remplacé | une base station ou l'écran bouge | un tracker est démonté ou glisse |
 
+### Presets — rappeler un studio d'un coup
+
+`bridge/presets/<nom>.json` regroupe les **trois** fichiers ci-dessus sous un
+seul nom. Une fois les trackers vissés sur la caméra, les changements
+deviennent rares : un preset évite de refaire trois calibrations pour
+retrouver une configuration connue.
+
+Charger un preset réécrit aussi `roles.json`, `world.json` et `axes.json` —
+sinon la console dirait une chose et le bridge en ferait une autre.
+
+Le nom est un nom de fichier, et la console écoute sur le réseau : il est
+filtré pour ne pas pouvoir sortir du répertoire. Le `--selftest` le vérifie
+sur le chemin **résolu**, pas sur l'absence de `..` dans le nom.
+
 ### `roles.json` — un tracker est une variable
 
 Quatre fonctions, attribuées à la main **avant tout le reste** :

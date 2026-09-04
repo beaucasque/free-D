@@ -66,6 +66,7 @@ import worldframe      # noqa: E402
 AXES_PATH = os.path.join(BRIDGE, "axes.json")
 WORLD_PATH = os.path.join(BRIDGE, "world.json")
 ROLES_PATH = os.path.join(BRIDGE, "roles.json")
+PRESETS = os.path.join(BRIDGE, "presets")
 
 ROLES = [
     ("camera", "Tracker CAMÉRA — sur la cage"),
@@ -344,7 +345,14 @@ class Hub:
             st = self.outs[name] = {
                 "cal": cal,
                 "inv_ref": lensaxis.q_conj(tuple(cal["ref"])),
-                "acc": lensaxis.Accumulator()}
+                "acc": lensaxis.Accumulator(),
+                # Meme filtre que vp_bridge.py, memes valeurs par defaut.
+                # Sans lui, l'onglet Sortie afficherait et emettrait des
+                # valeurs plus bruyantes que ce qu'Unreal recevra du bridge
+                # — deux chiffres differents pour la meme installation.
+                # Le §7 rappelle qu'on filtre theta, JAMAIS le quaternion.
+                "filt": lensaxis.OneEuro(),
+                "watch": lensaxis.MountWatch()}
         return st
 
     def _out_update(self, t, dev, quat, got):
@@ -362,9 +370,10 @@ class Hub:
         if st is None:
             return
         q_cam = got[0]
-        st["theta"] = st["acc"].push(lensaxis.twist_angle(
+        theta = st["acc"].push(lensaxis.twist_angle(
             lensaxis.q_mul(st["inv_ref"], lensaxis.relative(q_cam, quat)),
             st["cal"]["axis"]))
+        st["theta"] = st["filt"](theta, t)
 
     def _out_frame(self, now):
         """Assemble la trame, l'encode, la decode, et l'emet si demande.
@@ -695,6 +704,109 @@ class Hub:
             self.sweep_result = None
             self._wd_say("Balayage %s abandonne : %s." % (name, why))
 
+    # -- presets -----------------------------------------------------------
+
+    def presets(self):
+        """Noms des presets, du plus recent au plus ancien."""
+        try:
+            f = [x[:-5] for x in os.listdir(PRESETS) if x.endswith(".json")]
+        except OSError:
+            return []
+        f.sort(key=lambda n: os.path.getmtime(os.path.join(PRESETS, n + ".json")),
+               reverse=True)
+        return f
+
+    @staticmethod
+    def _preset_path(name):
+        """Un nom de preset est un NOM DE FICHIER : il ne doit pas pouvoir
+        sortir du repertoire. La console ecoute sur le reseau."""
+        safe = re.sub(r"[^A-Za-z0-9 _.-]", "", str(name)).strip().strip(".")
+        if not safe:
+            raise ValueError("nom vide ou invalide")
+        return safe, os.path.join(PRESETS, safe + ".json")
+
+    def preset_save(self, name):
+        """Enregistre roles + world + axes sous un nom.
+
+        Les trois fichiers d'installation du §4 dans un seul, pour rappeler
+        un studio d'un coup plutot que de refaire trois calibrations.
+        """
+        with self.lock:
+            try:
+                safe, path = self._preset_path(name)
+            except ValueError as e:
+                self.msg = "Preset : %s" % e
+                return
+            data = {
+                "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "roles": dict(self.roles),
+                "world": self.world,
+                "axes": self.axes,
+            }
+            try:
+                os.makedirs(PRESETS, exist_ok=True)
+                with open(path, "w") as f:
+                    json.dump(data, f, indent=2)
+                    f.write("\n")
+            except OSError as e:
+                self.msg = "Preset non ecrit : %s" % e
+                return
+            have = [k for k in ("roles", "world", "axes") if data[k]]
+            self.msg = "Preset « %s » enregistre (%s)." % (safe, ", ".join(have) or "vide")
+
+    def preset_load(self, name):
+        """Rappelle un preset : roles, repere et axes d'un coup.
+
+        Ecrit aussi les trois fichiers du §4, pour que le BRIDGE reparte sur
+        la meme configuration : sinon la console dirait une chose et le
+        bridge en ferait une autre.
+        """
+        with self.lock:
+            try:
+                safe, path = self._preset_path(name)
+                with open(path) as f:
+                    d = json.load(f)
+            except (OSError, ValueError) as e:
+                self.msg = "Preset illisible : %s" % e
+                return
+
+            self.roles = {k: v for k, v in (d.get("roles") or {}).items()
+                          if k in dict(ROLES) and v}
+            self.camera = self.roles.get("camera")
+            self.hist = lensaxis.CameraHistory(span=2.0)
+            self.world = d.get("world") or None
+            self.axes = d.get("axes") or {}
+
+            # Tout ce qui derivait de l'ancienne configuration est caduc.
+            self.outs.clear()
+            self.wd_state.clear()
+            self._wf = self._wf_key = None
+            self.sweep = self.sweep_result = None
+            self.capture = None
+            self.slots = {k: [] for k, _lab in SLOTS}
+
+            self._save_roles()
+            try:
+                if self.world:
+                    worldframe.save(WORLD_PATH, self.world)
+                lensaxis.save(AXES_PATH,
+                              {"camera": self.camera, "axes": self.axes})
+            except OSError as e:
+                self.msg = "Preset charge, mais non ecrit sur disque : %s" % e
+                return
+            self.msg = ("Preset « %s » charge : %d role(s), repere %s, %d axe(s)."
+                        % (safe, len(self.roles),
+                           "oui" if self.world else "non", len(self.axes)))
+
+    def preset_delete(self, name):
+        with self.lock:
+            try:
+                safe, path = self._preset_path(name)
+                os.remove(path)
+                self.msg = "Preset « %s » supprime." % safe
+            except (OSError, ValueError) as e:
+                self.msg = "Suppression impossible : %s" % e
+
     def manual_reset(self, serial):
         """Reinitialisation demandee a la main depuis l'interface."""
         with self.lock:
@@ -1007,6 +1119,7 @@ class Hub:
             out["test"] = self._test_snapshot() if self.tap else None
             out["results"] = self.results
             out["roles"] = dict(self.roles)
+            out["presets"] = self.presets()
             out["wd"] = {
                 "on": self.wd_on,
                 "log": [{"t": t, "m": m} for t, m in self.wd_log],
@@ -1295,6 +1408,20 @@ ol.ph small{grid-column:2;color:var(--dim);font-size:11.5px;
       Changer le tracker <b>caméra</b> efface les deux axes — ils sont
       calibrés en relatif caméra.</p>
     </div>
+    <div class="card"><h3>Preset de studio</h3>
+      <div class="row"><label>Nom</label><input id="pname" value="studio"></div>
+      <div style="display:flex;gap:8px;margin:10px 0">
+        <button class="go" id="b-pset-save">Enregistrer</button>
+      </div>
+      <table><tbody id="plist"></tbody></table>
+      <p class="note">Un preset regroupe les <b>trois</b> fichiers du §4 —
+      rôles, repère plateau, calibrations d'axes — sous un seul nom. Une fois
+      les trackers vissés sur la caméra, c'est ce qui rappelle ton studio
+      d'un coup au lieu de refaire trois calibrations.</p>
+      <p class="note">Charger un preset écrit aussi <code>roles.json</code>,
+      <code>world.json</code> et <code>axes.json</code> : le bridge repart
+      donc sur la même configuration que la console.</p>
+    </div>
     <div class="card"><h3>Surveillance</h3>
       <div id="wdstat" class="note"></div>
       <div style="display:flex;gap:8px;margin:10px 0">
@@ -1483,6 +1610,7 @@ function build(){
     +encodeURIComponent($("ehost").value)+"&eport="
     +encodeURIComponent($("eport").value));
   $("b-emit-stop").onclick=()=>go("emit_stop=1");
+  $("b-pset-save").onclick=()=>go("preset_save="+encodeURIComponent($("pname").value));
   $("b-wd-on").onclick=()=>go("wd=1");
   $("b-wd-off").onclick=()=>go("wd=0");
   $("b-ph-stop").onclick=()=>go("phase_stop=1");
@@ -1554,6 +1682,22 @@ function roles(s){
     lg.innerHTML=(W.log||[]).map(e=>
       '<tr><td class="mono dim">'+e.t+'</td><td>'+e.m+'</td></tr>').join('')
       || '<tr><td class="note">Aucun incident.</td></tr>';
+  }
+
+  // presets
+  const pl=$("plist");
+  if(pl){
+    const ps=s.presets||[];
+    pl.innerHTML = ps.length ? ps.map(n=>
+      '<tr><td>'+n+'</td>'
+      +'<td style="text-align:right"><button data-p="'+n+'" class="pld">Charger</button> '
+      +'<button data-p="'+n+'" class="pdel stop">Suppr.</button></td></tr>').join('')
+      : '<tr><td class="note">Aucun preset enregistré.</td></tr>';
+    pl.querySelectorAll(".pld").forEach(b=>b.onclick=()=>
+      go("preset_load="+encodeURIComponent(b.dataset.p)));
+    pl.querySelectorAll(".pdel").forEach(b=>b.onclick=()=>{
+      if(confirm("Supprimer le preset « "+b.dataset.p+" » ?"))
+        go("preset_del="+encodeURIComponent(b.dataset.p))});
   }
 
   const w=$("survey-who");
@@ -2067,6 +2211,12 @@ class Handler(BaseHTTPRequestHandler):
             h.msg = "Surveillance %s." % ("activee" if h.wd_on else "desactivee")
         elif "reset_dev" in q:
             h.manual_reset(q["reset_dev"])
+        elif "preset_save" in q:
+            h.preset_save(q["preset_save"])
+        elif "preset_load" in q:
+            h.preset_load(q["preset_load"])
+        elif "preset_del" in q:
+            h.preset_delete(q["preset_del"])
 
 
 def selftest():
@@ -2084,16 +2234,17 @@ def selftest():
     l'axes.json reel et l'auto-test ne dirait plus la meme chose selon
     l'etat de calibration de la machine.
     """
-    global AXES_PATH, WORLD_PATH, ROLES_PATH
-    saved = (AXES_PATH, WORLD_PATH, ROLES_PATH)
+    global AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS
+    saved = (AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS)
     tmp = tempfile.mkdtemp(prefix="vp-console-selftest-")
     AXES_PATH = os.path.join(tmp, "axes.json")
     WORLD_PATH = os.path.join(tmp, "world.json")
     ROLES_PATH = os.path.join(tmp, "roles.json")
+    PRESETS = os.path.join(tmp, "presets")
     try:
         return _selftest_run()
     finally:
-        AXES_PATH, WORLD_PATH, ROLES_PATH = saved
+        AXES_PATH, WORLD_PATH, ROLES_PATH, PRESETS = saved
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -2221,6 +2372,41 @@ def _selftest_run():
         assert hub.sweep_result, hub.msg
         hub.sweep_save()
     assert set(hub.axes) == {"focus", "zoom"}
+
+    # -- presets ----------------------------------------------------------
+    # Un preset regroupe roles + repere + axes : ce qui rappelle un studio
+    # d'un coup, une fois les trackers visses.
+    hub.preset_save("essai")
+    assert "essai" in hub.presets(), hub.presets()
+
+    ref_roles, ref_axes = dict(hub.roles), set(hub.axes)
+    hub.roles, hub.camera, hub.world, hub.axes = {}, None, None, {}
+    hub.preset_load("essai")
+    assert hub.roles == ref_roles, (hub.roles, ref_roles)
+    assert set(hub.axes) == ref_axes, hub.axes
+    assert hub.world, "le repere n'a pas ete rappele"
+    assert hub.camera == ref_roles["camera"], hub.camera
+    print("preset    : roles, repere et axes rappeles d'un coup")
+
+    # Le nom est un NOM DE FICHIER et la console ecoute sur le reseau : il ne
+    # doit pas pouvoir sortir du repertoire.
+    for bad in ("../evasion", "/etc/passwd", "..", "", "   ", "a/../../b"):
+        try:
+            safe, path = hub._preset_path(bad)
+        except ValueError:
+            continue
+        # La propriete qui compte n'est pas l'absence de « .. » dans le nom
+        # — « a/../../b » devient « a....b », inoffensif — mais que le
+        # chemin RESOLU reste dans le repertoire des presets.
+        assert os.path.dirname(os.path.realpath(path)) \
+            == os.path.realpath(PRESETS), \
+            "le nom %r sort du repertoire : %s" % (bad, path)
+        assert os.sep not in safe, safe
+    print("garde     : nom de preset hors repertoire -> refuse")
+
+    hub.preset_delete("essai")
+    assert "essai" not in hub.presets(), hub.presets()
+    print("preset    : suppression")
 
     # -- chien de garde ---------------------------------------------------
     # On PROVOQUE la panne : un chien de garde qu'on ne declenche pas est

@@ -101,6 +101,7 @@ bridge/      la chaîne temps réel
   vp_bridge.py       3 trackers → Free-D, applique world.json et axes.json
   requirements.txt   numpy >= 1.24 (plus pysurvive, hors PyPI)
   roles.json         quelle fonction pour quel n° de série (produit par la console)
+  presets/           configurations de studio nommées (rôles + repère + axes)
 tools/       calibration et diagnostic
   vp-console.py      serveur web, 5 onglets — Appareils, Studio, Objectifs,
                      Test, Sortie ; bandeau de santé permanent
